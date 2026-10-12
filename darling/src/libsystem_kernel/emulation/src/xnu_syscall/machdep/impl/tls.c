@@ -32,6 +32,11 @@ unsigned long sys_thread_get_native_tsd_slot_offset(void) {
     return native_tsd_slot_offset;
 }
 static void publish_native_tsd_slot(void* base) {
+#if defined(__aarch64__)
+    __atomic_store_n(&((void**)__builtin_thread_pointer())[8], base, __ATOMIC_RELEASE);
+    if (native_tsd_slot_offset == 8 * sizeof(void*))
+        return;
+#endif
     if (native_tsd_slot_offset != ~0UL)
         __atomic_store_n((void**)((uintptr_t)__builtin_thread_pointer() + native_tsd_slot_offset), base, __ATOMIC_RELEASE);
 }

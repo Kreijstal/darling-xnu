@@ -1,5 +1,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/mman/mman.h>
 
+#include <stdint.h>
+#include <unistd.h>
 #include <darling/emulation/conversion/mman/duct_mman.h>
 #include <darling/emulation/conversion/errno.h>
 #include <darling/emulation/common/base.h>
@@ -57,9 +59,21 @@ void* sys_mmap(void* start, unsigned long len, int prot, int flags, int fd, long
 
 long sys_munmap(void* addr, unsigned long len)
 {
+	if (len == 0)
+		return 0;
+
+	unsigned long page_size = 4096;
+	uintptr_t uaddr = (uintptr_t) addr;
+	uintptr_t page_offset = uaddr & (page_size - 1);
+	if (page_offset != 0) {
+		uaddr -= page_offset;
+		len += page_offset;
+	}
+	len = (len + page_size - 1) & ~(page_size - 1);
+
 	int ret;
 
-	ret = LINUX_SYSCALL2(__NR_munmap, addr, len);
+	ret = LINUX_SYSCALL2(__NR_munmap, (void*)uaddr, len);
 	if (ret < 0)
 		ret = errno_linux_to_bsd(ret);
 
