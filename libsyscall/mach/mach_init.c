@@ -191,6 +191,12 @@ mach_init_doit(void)
 	// Initialize cached mach ports defined in mach_init.h
 	mach_task_self_ = task_self_trap();
 	_task_reply_port = mach_reply_port();
+	if (bootstrap_port == MACH_PORT_NULL) {
+		kern_return_t kr = task_get_special_port(mach_task_self_, TASK_BOOTSTRAP_PORT, &bootstrap_port);
+		if (kr != KERN_SUCCESS) {
+			bootstrap_port = MACH_PORT_NULL;
+		}
+	}
 
 	if (vm_kernel_page_shift == 0) {
 #if defined(__x86_64__) || defined(__i386__)
