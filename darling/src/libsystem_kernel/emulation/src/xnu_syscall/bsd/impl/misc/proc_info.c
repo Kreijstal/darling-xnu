@@ -89,8 +89,18 @@ long sys_proc_info(uint32_t callnum, int32_t pid, uint32_t flavor,
 			return _proc_pidinfo_pidrusage(pid, flavor, buffer, bufsize);
 		case 2: // proc_pidinfo
 			return _proc_pidinfo(pid, flavor, arg, buffer, bufsize);
+		case 1: { // proc_listpids (stub: returns own PID)
+			if (buffer == NULL || bufsize == 0) {
+				return sizeof(pid_t);
+			}
+			if ((size_t)bufsize >= sizeof(pid_t)) {
+				pid_t my_pid = sys_getpid();
+				memcpy(buffer, &my_pid, sizeof(pid_t));
+				return sizeof(pid_t);
+			}
+			return -ENOMEM;
+		}
 		case 3: // proc_pidfdinfo
-		case 1: // proc_listpids
 		default:
 			__simple_printf("sys_proc_info(): Unsupported callnum: %d\n",
 					callnum);
