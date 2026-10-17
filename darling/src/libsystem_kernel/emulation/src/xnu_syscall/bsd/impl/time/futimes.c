@@ -16,6 +16,8 @@ long sys_futimes(int fd, struct bsd_timeval* tv)
 
 	if (tv) {
 		for (int i = 0; i < 2; ++i) {
+			// On LP64 the kernel would reject an out-of-range nsec itself; this check is for i386,
+			// where (long)tv_usec * 1000 overflows for |usec| above 2147483.
 			if (tv[i].tv_usec < 0 || tv[i].tv_usec >= 1000000)
 				return errno_linux_to_bsd(-LINUX_EINVAL);
 			times[i].tv_sec = tv[i].tv_sec;

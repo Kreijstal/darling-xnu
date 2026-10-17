@@ -19,7 +19,8 @@ program = <<~C
   struct bsd_timeval { unsigned long tv_sec; int tv_usec; };
   struct linux_timeval { unsigned long tv_sec; long tv_usec; };
   #define LINUX_EINVAL EINVAL
-  #define LINUX_SYSCALL(nr, a, b, c, d) (syscall(nr, a, b, c, d) < 0 ? -errno : 0)
+  static int syscalls;
+  #define LINUX_SYSCALL(nr, a, b, c, d) (syscalls++, syscall(nr, a, b, c, d) < 0 ? -errno : 0)
   static long errno_linux_to_bsd(long e) { return e; }
   #{body}
   int main(int argc, char **argv) {
@@ -37,8 +38,14 @@ program = <<~C
       time_t before = time(NULL);
       assert(sys_futimes(fd, NULL) == 0 && fstat(fd, &st) == 0);
       assert(st.st_mtim.tv_sec >= before && st.st_mtim.tv_sec <= time(NULL));
+      // The range check must reject before any syscall: the host kernel would also say EINVAL on
+      // LP64, so only the syscall count shows the check ran (it guards the i386 overflow).
+      int before_bad = syscalls;
       struct bsd_timeval bad[2] = { { 1, 1000000 }, { 1, 0 } };
       assert(sys_futimes(fd, bad) == -EINVAL);
+      struct bsd_timeval bad2[2] = { { 1, 0 }, { 1, -1 } };
+      assert(sys_futimes(fd, bad2) == -EINVAL);
+      assert(syscalls == before_bad);
       puts("PASS: microseconds become nanoseconds, NULL means now, bad usec is EINVAL");
       return 0;
   }
