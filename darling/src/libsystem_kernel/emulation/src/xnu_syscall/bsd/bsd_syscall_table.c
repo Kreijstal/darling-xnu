@@ -128,6 +128,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/time/futimes.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/time/getitimer.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/time/gettimeofday.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/time/ntp_adjtime.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/time/setitimer.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/time/utimes.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/access.h>
@@ -502,6 +503,7 @@ void* __bsd_syscall_table[600] = {
 	[520] = sys_terminate_with_payload,
 	[521] = sys_abort_with_payload,
 	[524] = sys_setattrlistat,
+	[527] = sys_ntp_adjtime,
 	[539] = sys_fsgetpath,
 	[540] = sys_preadv,
 	[541] = sys_pwritev,
