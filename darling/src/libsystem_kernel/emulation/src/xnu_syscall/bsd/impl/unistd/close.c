@@ -48,6 +48,12 @@ long sys_close_nocancel(int fd)
 
 long close_internal(int fd)
 {
+	// Protect the darlingserver RPC socket and commpage from accidental closure by
+	// guest subprocesses or posix_spawn fd cleanup loops. We return 0 as a no-op
+	// defence-in-depth so loops sweeping descriptors do not abort or fail.
+	if (fd == mach_driver_get_fd() || fd == 1023) {
+		return 0;
+	}
 	int ret;
 
 	ret = LINUX_SYSCALL1(__NR_close, fd);

@@ -1,4 +1,5 @@
 #include <darling/emulation/linux_premigration/signal/sigexc.h>
+#include <darling/emulation/conversion/duct_errno.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -163,10 +164,11 @@ void sigexc_setup(void)
 }
 
 // darlingserver RPC failures that mean the server has gone away (e.g. during `darling shutdown`),
-// as negative Linux errno values: ENOENT, EPIPE, ECONNRESET, ENOTCONN, ECONNREFUSED.
+// or the thread's RPC socket is closed/invalid (EBADF), as negative Linux errno values.
 static bool is_server_gone(int status)
 {
-	return status == -2 || status == -32 || status == -104 || status == -107 || status == -111;
+	return status == -LINUX_ENOENT || status == -LINUX_EPIPE || status == -LINUX_ECONNRESET ||
+	       status == -LINUX_ENOTCONN || status == -LINUX_ECONNREFUSED || status == -LINUX_EBADF;
 }
 
 // The process can't continue without darlingserver. Exit without a core dump, but with a failure

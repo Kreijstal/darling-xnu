@@ -133,8 +133,8 @@ no_fork:
 						fd = __simple_atoi(dirent->d_name, NULL);
 
 						// FIXME: pretty sure this should not be hardcoded
-						if (fd == 1023) {
-							// special commpage fd
+						if (fd == 1023 || fd == mach_driver_get_fd()) {
+							// special commpage fd and darlingserver RPC socket
 							continue;
 						}
 
@@ -227,6 +227,9 @@ no_fork:
 				switch (act->psfaa_type)
 				{
 					case XNU_PSFA_CLOSE:
+						if (act->psfaa_filedes == mach_driver_get_fd() || act->psfaa_filedes == 1023) {
+							break;
+						}
 						//__simple_kprintf("closing %d\n", act->psfaa_filedes);
 						ret = close_internal(act->psfaa_filedes);
 						if (ret != 0)
