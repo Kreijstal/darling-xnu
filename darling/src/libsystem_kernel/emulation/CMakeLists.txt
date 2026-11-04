@@ -6,6 +6,9 @@ enable_language(ASM)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -std=gnu99 -fvisibility=hidden -fPIC -fno-builtin -ggdb -Wno-int-conversion -Wno-compare-distinct-pointer-types")
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -nostdlib")
 
+set(DARLING_EMULATED_IOS_PRODUCT_VERSION "14.0" CACHE STRING
+	"Product version returned by kern.osproductversion to iOS executables")
+
 # The release this kernel emulates: macOS 26.4, build 25E246, Darwin 25.4.0.
 # kern.osrelease, kern.version, kern.osversion and kern.osproductversion are
 # answered from these values. They are also published as global properties so
@@ -25,6 +28,7 @@ add_definitions(-DBSDTHREAD_WRAP_LINUX_PTHREAD
 	-DEMULATED_VERSION="Darwin Kernel Version ${EMULATED_RELEASE}"
 	-DEMULATED_OSVERSION="${EMULATED_OSVERSION}"
 	-DEMULATED_OSPRODUCTVERSION="${EMULATED_OSPRODUCTVERSION}"
+	-DEMULATED_IOS_OSPRODUCTVERSION="${DARLING_EMULATED_IOS_PRODUCT_VERSION}"
 )
 
 # include src/startup for rtsig.h
@@ -133,6 +137,7 @@ set(xnu_syscall_bsd_sources
 	src/xnu_syscall/bsd/helper/misc/sysctl_unspec.c
 	src/xnu_syscall/bsd/helper/misc/sysctl_vm.c
 	src/xnu_syscall/bsd/helper/network/duct.c
+	src/xnu_syscall/bsd/helper/network/nosigpipe.c
 
 	src/xnu_syscall/bsd/impl/audit/audit_addr.c
 	src/xnu_syscall/bsd/impl/audit/auditon.c
