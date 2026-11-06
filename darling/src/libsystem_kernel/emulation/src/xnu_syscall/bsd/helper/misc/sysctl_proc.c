@@ -188,7 +188,7 @@ const char* next_stat_elem(char** buf)
 
 		*end = '\0';
 		end++;
-		if (*end == ' ')
+		if (*end != '\0' && *end == ' ')
 			end++;
 		*buf = end;
 		return start;
@@ -254,7 +254,8 @@ static struct kinfo_proc_chain* load_proc(const char* name, int what, int flag)
 
 	// comm
 	READELEM();
-	strncpy(kinfo->kinfo.kp_proc.p_comm, elem, sizeof(kinfo->kinfo.kp_proc.p_comm));
+	strncpy(kinfo->kinfo.kp_proc.p_comm, elem, sizeof(kinfo->kinfo.kp_proc.p_comm) - 1);
+	kinfo->kinfo.kp_proc.p_comm[sizeof(kinfo->kinfo.kp_proc.p_comm) - 1] = '\0';
 
 	// process state
 	READELEM();
@@ -300,7 +301,7 @@ static struct kinfo_proc_chain* load_proc(const char* name, int what, int flag)
 	if (kinfo->kinfo.kp_eproc.e_tdev != 0)
 		kinfo->kinfo.kp_proc.p_flag |= P_CONTROLT;
 
-	skip_stat_elems(&statptr, NULL);
+	skip_stat_elems(&statptr, 10);
 
 	READELEM();
 	kinfo->kinfo.kp_proc.p_priority = __simple_atoi(elem, NULL);
