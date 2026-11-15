@@ -121,7 +121,14 @@ static long mount_table_update_locked(void)
 	if (mount_table_fd >= 0)
 	{
 		struct linux_pollfd pfd = { .fd = mount_table_fd, .events = LINUX_POLLPRI, .revents = 0 };
-		long ret = LINUX_SYSCALL(__NR_poll, &pfd, 1, 0);
+		long ret;
+#ifdef __NR_poll
+		ret = LINUX_SYSCALL(__NR_poll, &pfd, 1, 0);
+#else
+		// ARM64 has ppoll instead of poll; keep this an immediate readiness check.
+		struct { long tv_sec; long tv_nsec; } zero = { 0, 0 };
+		ret = LINUX_SYSCALL(__NR_ppoll, &pfd, 1, &zero, NULL, 0);
+#endif
 
 		if (ret > 0 && (pfd.revents & LINUX_POLLNVAL))
 		{
