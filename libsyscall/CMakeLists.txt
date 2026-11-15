@@ -166,9 +166,10 @@ set(syscall_dynamic_sources
 	wrappers/_libc_funcptr.c
 	wrappers/_libkernel_init.c)
 
-# select-pre1050 conflicts with select-cancel on ARM64 (duplicate symbols);
-# pre-1050 legacy wrappers are only needed for i386/x86_64 compatibility
-if (NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+# This LP64 legacy variant belongs to x86_64 guests, independent of the host.
+# ARM64 uses the unversioned entry points from select-cancel instead.
+unset(syscall_select_pre1050_source)
+if (TARGET_x86_64)
 	set(syscall_select_pre1050_source wrappers/legacy/select-pre1050.c)
 endif()
 
