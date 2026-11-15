@@ -157,7 +157,7 @@ static long check_library_validation(int fd, fchecklv_t* check)
 // the protection class checks in syscall-small-fixes.c (guest test).
 static long protection_class(int fd, int cmd, int pclass)
 {
-	struct stat64 st;
+	darling_stat64_t st;
 	long ret;
 
 	ret = sys_fstat64(fd, &st);
@@ -191,9 +191,9 @@ static long snapshot_image(int fd)
 {
 	static const char name[] = "darling-image-snapshot";
 	char buffer[16384];
-	// sys_fstat fills the legacy (32-bit inode) layout of the fstat system call,
-	// which is not the struct stat this file is compiled with; stat64 is unambiguous
-	struct stat64 st;
+	// Match the internal 64-bit-inode syscall type: Darwin ARM64 uses
+	// struct stat here, while the other supported ABIs use struct stat64.
+	darling_stat64_t st;
 	long snapshot, ret;
 	unsigned long long offset = 0;
 
