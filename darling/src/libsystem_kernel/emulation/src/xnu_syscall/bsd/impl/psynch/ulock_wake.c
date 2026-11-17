@@ -13,10 +13,6 @@ long sys_ulock_wake(uint32_t operation, void* addr, uint64_t wake_value)
 {
 	int ret, op;
 
-	// char buf[100];
-	// __simple_sprintf(buf, "ulock_wake on %p", addr);
-	// lkm_call(0x1024, buf);
-
 	op = operation & XNU_UL_OPCODE_MASK;
 	if (op == XNU_UL_COMPARE_AND_WAIT || op == XNU_UL_UNFAIR_LOCK ||
 		op == XNU_UL_COMPARE_AND_WAIT_SHARED || op == XNU_UL_UNFAIR_LOCK64_SHARED ||
@@ -31,13 +27,15 @@ long sys_ulock_wake(uint32_t operation, void* addr, uint64_t wake_value)
 		else
 			value = 1;
 
-		bool is_shared = (op == XNU_UL_COMPARE_AND_WAIT_SHARED ||
-						  op == XNU_UL_UNFAIR_LOCK64_SHARED ||
-						  op == XNU_UL_COMPARE_AND_WAIT64_SHARED);
-		int futex_flags = is_shared ? 0 : FUTEX_PRIVATE_FLAG;
-
-		ret = LINUX_SYSCALL(__NR_futex, addr, FUTEX_WAKE | futex_flags,
+		// A 64-bit wait is queued on both halves of the word (see ulock_wait64()), so waking the
+		// address reaches it. The shared operations wait on the process-shared futex key.
+		ret = LINUX_SYSCALL(__NR_futex, addr,
+			FUTEX_WAKE | (xnu_ulock_op_is_shared(op) ? 0 : FUTEX_PRIVATE_FLAG),
 			value);
+
+		// ulock_wake reports ENOENT when no thread was waiting
+		if (ret == 0)
+			return -ENOENT;
 	}
 	else
 		return -EINVAL;

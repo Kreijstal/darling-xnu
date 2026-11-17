@@ -2,6 +2,7 @@
 #include <darling/emulation/xnu_syscall/bsd/helper/misc/sysctl_vm.h>
 
 #include <sys/errno.h>
+#include <sys/syslimits.h>
 
 #include <darling/emulation/xnu_syscall/bsd/helper/misc/sysctl_proc.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/misc/getrlimit.h>
@@ -21,10 +22,8 @@
 
 #include <darling/emulation/xnu_syscall/bsd/helper/misc/readline.h>
 #include <darling/emulation/common/string.h>
+#include <darling/emulation/xnu_syscall/bsd/helper/misc/host_platform.h>
 #include "proc_boottime.h"
-#include <darling/emulation/conversion/common_at.h>
-#include <darling/emulation/conversion/duct_errno.h>
-#include <stdbool.h>
 
 #include <darling-config.h>
 #include <darling/emulation/other/mach/lkm.h>
@@ -32,8 +31,10 @@
 enum {
 	_KERN_MSGBUF = 1000,
 	_KERN_OSPRODUCTVERSION,
-	_KERN_NUM_FILES,
+	_KERN_SECURE_KERNEL,
 	_KERN_MEMORYSTATUS_LEVEL,
+	_KERN_NUM_FILES,
+	_KERN_HV_VMM_PRESENT,
 
 	_KERN_SEMMNS = 1000,
 };
@@ -50,10 +51,10 @@ static sysctl_handler(handle_osrelease);
 static sysctl_handler(handle_version);
 static sysctl_handler(handle_osversion);
 static sysctl_handler(handle_maxproc);
+static sysctl_handler(handle_memorystatus_level);
 static sysctl_handler(handle_maxfiles);
 static sysctl_handler(handle_maxfilesperproc);
 static sysctl_handler(handle_num_files);
-static sysctl_handler(handle_memorystatus_level);
 static sysctl_handler(handle_netboot);
 static sysctl_handler(handle_safeboot);
 static sysctl_handler(handle_usrstack32);
@@ -61,6 +62,8 @@ static sysctl_handler(handle_usrstack64);
 static sysctl_handler(handle_sysv_semmns);
 static sysctl_handler(handle_osproductversion);
 static sysctl_handler(handle_osrevision);
+static sysctl_handler(handle_hv_vmm_present);
+static sysctl_handler(handle_secure_kernel);
 
 extern int _sysctl_proc(int what, int flag, struct kinfo_proc* out, unsigned long* buflen);
 extern int _sysctl_procargs(int pid, char* buf, unsigned long* buflen);
@@ -95,6 +98,8 @@ const struct known_sysctl sysctls_kern[] = {
 	{ .oid = KERN_USRSTACK64, .type = CTLTYPE_QUAD, .exttype = "Q", .name = "usrstack64", .handler = handle_usrstack64 },
 	{ .oid = _KERN_OSPRODUCTVERSION, .type = CTLTYPE_STRING, .exttype = "S", .name = "osproductversion", .handler = handle_osproductversion },
 	{ .oid = KERN_OSREV, .type = CTLTYPE_INT, .exttype = "I", .name = "osrevision", .handler = handle_osrevision },
+	{ .oid = _KERN_HV_VMM_PRESENT, .type = CTLTYPE_INT, .exttype = "I", .name = "hv_vmm_present", .handler = handle_hv_vmm_present },
+	{ .oid = _KERN_SECURE_KERNEL, .type = CTLTYPE_INT, .exttype = "I", .name = "secure_kernel", .handler = handle_secure_kernel },
 	{ .oid = KERN_SYSV, .type = CTLTYPE_NODE, .exttype = "", .name = "sysv", .subctls = sysctls_kern_sysv },
 	{ .oid = -1 }
 };
@@ -125,6 +130,9 @@ sysctl_handler(handle_msgbuf)
 
 sysctl_handler(handle_proc)
 {
+	// KERN_PROC_ALL takes no argument, so its name has three components.
+	if (nlen == 3 && name[2] == KERN_PROC_ALL)
+		return _sysctl_proc(KERN_PROC_ALL, 0, (struct kinfo_proc*) old, oldlen);
 	if (nlen < 4)
 		return -ENOENT;
 	return _sysctl_proc(name[2], name[3], (struct kinfo_proc*) old, oldlen);
@@ -140,6 +148,7 @@ sysctl_handler(handle_procargs32)
 sysctl_handler(handle_argmax)
 {
 	struct xnu_rlimit lim;
+	unsigned long long argmax;
 	int r;
 	int* ovalue = (int*) old;
 
@@ -147,10 +156,69 @@ sysctl_handler(handle_argmax)
 	if (r < 0)
 		return r;
 
+	// macOS reports the fixed ARG_MAX whatever the stack limit is. Linux
+	// lets exec() take a quarter of the stack limit, so report that when it
+	// is lower; an unlimited stack must not overflow the int.
+	argmax = lim.rlim_cur / 4;
+	if (argmax > ARG_MAX)
+		argmax = ARG_MAX;
+
 	if (ovalue != NULL)
-		*ovalue = lim.rlim_cur / 4;
+		*ovalue = (int) argmax;
 	*oldlen = sizeof(int);
 	return 0;
+}
+
+// Linux clock IDs (Darwin's <time.h> numbers its clocks differently).
+#define LINUX_CLOCK_REALTIME 0
+#define LINUX_CLOCK_BOOTTIME 7
+
+// Last boot time read from /proc/stat, in seconds; 0 until the first read.
+static unsigned long boottime_cache;
+
+static int read_proc_boottime(unsigned long* seconds)
+{
+	int fd = sys_open_nocancel("/proc/stat", BSD_O_RDONLY, 0);
+	if (fd < 0)
+		return fd;
+	struct rdline_buffer buffer;
+	_readline_init(&buffer);
+	const char* line;
+	*seconds = 0;
+	while ((line = _readline(fd, &buffer)) != NULL)
+	{
+		if (strncmp(line, "btime ", 6) == 0)
+		{
+			if (!parse_proc_boottime(line + 6, seconds))
+				*seconds = 0;
+			break;
+		}
+	}
+	close_internal(fd);
+	return *seconds ? 0 : -EIO;
+}
+
+// Linux derives btime from the offset between CLOCK_REALTIME and
+// CLOCK_BOOTTIME, which only moves when the wall clock is set. Libc reads
+// kern.boottime twice for every CLOCK_MONOTONIC query, so keep the last
+// btime and only go back to /proc/stat when the current offset has left
+// the second that btime describes.
+static bool boottime_cache_valid(unsigned long seconds)
+{
+	struct timespec boot, real;
+
+	if (seconds == 0)
+		return false;
+	if (LINUX_SYSCALL(__NR_clock_gettime, LINUX_CLOCK_BOOTTIME, &boot) < 0)
+		return false;
+	if (LINUX_SYSCALL(__NR_clock_gettime, LINUX_CLOCK_REALTIME, &real) < 0)
+		return false;
+
+	long long offset_ns = (long long)(real.tv_sec - boot.tv_sec) * 1000000000LL
+		+ (real.tv_nsec - boot.tv_nsec);
+	long long cached_ns = (long long)seconds * 1000000000LL;
+
+	return offset_ns >= cached_ns && offset_ns < cached_ns + 1000000000LL;
 }
 
 sysctl_handler(handle_boottime)
@@ -165,25 +233,14 @@ sysctl_handler(handle_boottime)
 	if (*oldlen < sizeof(struct bsd_timeval))
 		return -EINVAL;
 
-	int fd = sys_open("/proc/stat", BSD_O_RDONLY, 0);
-	if (fd < 0)
-		return fd;
-	struct rdline_buffer buffer;
-	_readline_init(&buffer);
-	const char* line;
-	unsigned long seconds = 0;
-	while ((line = _readline(fd, &buffer)) != NULL)
+	unsigned long seconds = __atomic_load_n(&boottime_cache, __ATOMIC_RELAXED);
+	if (!boottime_cache_valid(seconds))
 	{
-		if (strncmp(line, "btime ", 6) == 0)
-		{
-			if (!parse_proc_boottime(line + 6, &seconds))
-				seconds = 0;
-			break;
-		}
+		int err = read_proc_boottime(&seconds);
+		if (err < 0)
+			return err;
+		__atomic_store_n(&boottime_cache, seconds, __ATOMIC_RELAXED);
 	}
-	close_internal(fd);
-	if (!seconds)
-		return -EIO;
 
 	struct bsd_timeval* value = old;
 	value->tv_sec = seconds;
@@ -196,32 +253,28 @@ sysctl_handler(handle_ostype)
 {
 	const char* s = EMULATED_SYSNAME;
 
-	copyout_string(s, (char*) old, oldlen);
-	return 0;
+	return copyout_string(s, (char*) old, oldlen);
 }
 
 sysctl_handler(handle_osrelease)
 {
 	const char* s = EMULATED_RELEASE;
 
-	copyout_string(s, (char*) old, oldlen);
-	return 0;
+	return copyout_string(s, (char*) old, oldlen);
 }
 
 sysctl_handler(handle_version)
 {
 	const char* s = EMULATED_VERSION;
 
-	copyout_string(s, (char*) old, oldlen);
-	return 0;
+	return copyout_string(s, (char*) old, oldlen);
 }
 
 sysctl_handler(handle_osversion)
 {
 	const char* s = EMULATED_OSVERSION;
 
-	copyout_string(s, (char*) old, oldlen);
-	return 0;
+	return copyout_string(s, (char*) old, oldlen);
 }
 
 
@@ -238,29 +291,35 @@ struct linux_utsname* need_uname(void)
 	return &lu;
 }
 
-/* Android's seccomp policy kills an app process that calls sethostname or
- * setdomainname (launchctl bootstrap sets the host name), where elsewhere an
- * unprivileged caller gets EPERM: that is what it gets there too. */
-static bool on_android(void)
-{
-	static int android = -1;
-	if (android < 0)
-		android = LINUX_SYSCALL(__NR_faccessat, LINUX_AT_FDCWD, "/system/bin/sh", 0, 0) == 0;
-	return android;
-}
-
 sysctl_handler(handle_hostname)
 {
 	int rv = 0;
 	
 	need_uname();
-	copyout_string(lu.nodename, (char*) old, oldlen);
+	copyout_string_truncated(lu.nodename, (char*) old, oldlen);
 	
 	if (_new && newlen > 0)
 	{
-		rv = on_android() ? -LINUX_EPERM : LINUX_SYSCALL(__NR_sethostname, _new, newlen);
-		if (rv < 0)
-			rv = errno_linux_to_bsd(rv);
+		// QUIRK: on Android the host name is not settable and the call
+		// fails with EPERM, as for an unprivileged caller on macOS (setting
+		// the host name needs privilege there). The call is not forwarded:
+		// on the Android kernels observed, issuing it raises SIGSYS and ends
+		// the process. Evidence: contributor observation on Android (tier 2,
+		// not reproduced by us; Android's app seccomp policy is not public
+		// API).
+		// Only active when host_platform_is_android(); other hosts forward
+		// the call and get the kernel's own answer.
+		// Test: sethostname-unprivileged-eperm.c (pins the unchanged result
+		// for an unprivileged caller on a normal host; the Android branch
+		// itself cannot be exercised off Android).
+		if (host_platform_is_android())
+			rv = -EPERM;
+		else
+		{
+			rv = LINUX_SYSCALL(__NR_sethostname, _new, newlen);
+			if (rv < 0)
+				rv = errno_linux_to_bsd(rv);
+		}
 	}
 	
 	return rv;
@@ -271,13 +330,21 @@ sysctl_handler(handle_domainname)
 	int rv = 0;
 	
 	need_uname();
-	copyout_string(lu.domainname, (char*) old, oldlen);
+	copyout_string_truncated(lu.domainname, (char*) old, oldlen);
 	
 	if (_new && newlen > 0)
 	{
-		rv = on_android() ? -LINUX_EPERM : LINUX_SYSCALL(__NR_setdomainname, _new, newlen);
-		if (rv < 0)
-			rv = errno_linux_to_bsd(rv);
+		// QUIRK: as for handle_hostname above: EPERM on Android without
+		// calling setdomainname, which raises SIGSYS there as well. Evidence:
+		// tier 2, same observation. Not active on other hosts.
+		if (host_platform_is_android())
+			rv = -EPERM;
+		else
+		{
+			rv = LINUX_SYSCALL(__NR_setdomainname, _new, newlen);
+			if (rv < 0)
+				rv = errno_linux_to_bsd(rv);
+		}
 	}
 	
 	return rv;
@@ -286,7 +353,7 @@ sysctl_handler(handle_domainname)
 sysctl_handler(handle_maxproc)
 {
 	char buf[16];
-	int fd = sys_open("/proc/sys/kernel/pid_max", BSD_O_RDONLY, 0);
+	int fd = sys_open_nocancel("/proc/sys/kernel/pid_max", BSD_O_RDONLY, 0);
 	int value = 1024;
 	int* ovalue = (int*) old;
 	
@@ -295,7 +362,7 @@ sysctl_handler(handle_maxproc)
 	
 	if (fd >= 0)
 	{
-		int rd = sys_read(fd, buf, sizeof(buf) - 1);
+		int rd = sys_read_nocancel(fd, buf, sizeof(buf) - 1);
 		close_internal(fd);
 		
 		if (rd > 0)
@@ -370,8 +437,7 @@ sysctl_handler(handle_usrstack64)
 static sysctl_handler(handle_osproductversion) {
 	// As on iOS, an iOS app sees the iOS version here, not the macOS one; apps (Rust's std,
 	// for one) answer #available from this, and must not take paths for iOS APIs Darling lacks.
-	copyout_string(mach_driver_main_is_ios() ? EMULATED_IOS_OSPRODUCTVERSION : EMULATED_OSPRODUCTVERSION, (char*)old, oldlen);
-	return 0;
+	return copyout_string(mach_driver_main_is_ios() ? EMULATED_IOS_OSPRODUCTVERSION : EMULATED_OSPRODUCTVERSION, (char*)old, oldlen);
 };
 
 // Apple no longer changes this value
@@ -386,21 +452,56 @@ static sysctl_handler(handle_osrevision) {
 	return 0;
 }
 
-static sysctl_handler(handle_maxfiles) {
-	sysctl_handle_size(sizeof(int));
-	*((int*) old) = 49152;
-	return 0;
+// Whether the kernel runs in the secure (restricted) mode; 0 on a normal
+// Mac, and read-only. Libc's opendir() reads it to decide how to handle
+// union mounts.
+static sysctl_handler(handle_secure_kernel)
+{
+	if (_new)
+		return -EPERM;
+	if (!oldlen)
+		return -EINVAL;
+	if (old == NULL)
+	{
+		*oldlen = sizeof(int);
+		return 0;
+	}
+	if (*oldlen < sizeof(int))
+		return -ENOMEM;
+
+	*(int*) old = 0;
+	*oldlen = sizeof(int);
+  
+  return 0;
 }
 
-static sysctl_handler(handle_maxfilesperproc) {
-	sysctl_handle_size(sizeof(int));
-	*((int*) old) = 10240;
-	return 0;
-}
+// Whether the system runs under a hypervisor: 1 if so, 0 on bare metal (and
+// on architectures without a way to tell); read-only. On x86 this is the
+// hypervisor-present bit (CPUID leaf 1, ECX bit 31).
+static sysctl_handler(handle_hv_vmm_present)
+{
+	int present = 0;
 
-static sysctl_handler(handle_num_files) {
-	sysctl_handle_size(sizeof(int));
-	*((int*) old) = 1024;
+	if (_new)
+		return -EPERM;
+	if (!oldlen)
+		return -EINVAL;
+	if (old == NULL)
+	{
+		*oldlen = sizeof(int);
+		return 0;
+	}
+	if (*oldlen < sizeof(int))
+		return -ENOMEM;
+
+#if defined(__i386__) || defined(__x86_64__)
+	unsigned int eax = 1, ebx, ecx = 0, edx;
+	__asm__ volatile ("cpuid" : "+a" (eax), "=b" (ebx), "+c" (ecx), "=d" (edx));
+	present = (ecx >> 31) & 1;
+#endif
+
+	*(int*) old = present;
+	*oldlen = sizeof(int);
 	return 0;
 }
 
@@ -411,4 +512,29 @@ static sysctl_handler(handle_memorystatus_level) {
 		return -EINVAL;
 	sysctl_handle_size(sizeof(int));
 	return _sysctl_memorystatus_level((int*)old);
+}
+// Linux's fs.file-max does not fit in an int and is no useful limit for
+// a guest; report macOS's value for a machine with little memory.
+static sysctl_handler(handle_maxfiles) {
+	sysctl_handle_size(sizeof(int));
+	*((int*) old) = 49152;
+	return 0;
+}
+
+// The most a guest's RLIMIT_NOFILE can be raised to (see nofile_limit.c).
+static sysctl_handler(handle_maxfilesperproc) {
+	sysctl_handle_size(sizeof(int));
+	*((int*) old) = DARWIN_OPEN_MAX;
+	return 0;
+}
+
+// Open files in the system: the first field of /proc/sys/fs/file-nr.
+static sysctl_handler(handle_num_files) {
+	char buf[64];
+
+	sysctl_handle_size(sizeof(int));
+	if (!read_string("/proc/sys/fs/file-nr", buf, sizeof(buf)))
+		return -ENOENT;
+	*((int*) old) = (int) __simple_atoi(buf, NULL);
+	return 0;
 }

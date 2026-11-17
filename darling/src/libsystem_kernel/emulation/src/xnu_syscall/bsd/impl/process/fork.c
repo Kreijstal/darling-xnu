@@ -9,10 +9,16 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/fchdir.h>
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
 #include <darling/emulation/common/simple.h>
+#include <darling/emulation/conversion/duct_errno.h>
 #include <darling/emulation/linux_premigration/elfcalls_wrapper.h>
 #include <darling/emulation/other/mach/lkm.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/close.h>
 #include <darling/emulation/common/guarded/table.h>
+#include <darling/emulation/xnu_syscall/bsd/helper/misc/nofile_limit.h>
+#include <darling/emulation/xnu_syscall/bsd/helper/bpf/bpf_device.h>
+#include <darling/emulation/common/tsd.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/bsdthread/bsdthread_register.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/bsdthread/workq_kernreturn.h>
 
 #include <darlingserver/rpc.h>
 
@@ -45,6 +51,8 @@ void sys_fork_postfork_child(void)
 		__simple_printf("Failed to checkin with darlingserver after fork\n");
 		__simple_abort();
 	}
+	if (bsdthread_registered())
+		set_thread_handles(_pthread_getspecific_direct(_PTHREAD_TSD_SLOT_PTHREAD_SELF));
 	if (postfork_child_wdfd >= 0)
 		sys_fchdir(postfork_child_wdfd);
 
@@ -54,18 +62,24 @@ void sys_fork_postfork_child(void)
 }
 #endif
 
+#if defined(__x86_64__) || defined(__i386__)
+// The ___fork stub reserves stack space of its own before it enters
+// __darling_bsd_syscall, so this function is not entered with the stack
+// alignment the ABI promises. The host libc's fork() may rely on it.
+__attribute__((force_align_arg_pointer))
+#endif
 long sys_fork(void)
 {
 	int ret;
 	int wdfd = get_perthread_wd();
 
-#if defined(__arm64__) || defined(__aarch64__)
+	// Fork through the host libc rather than with a raw syscall. Its fork()
+	// runs the atfork handlers of host libraries, takes the host allocator's
+	// locks so that the child does not inherit them held by threads that no
+	// longer exist, and updates the thread state the host libc keeps (such as
+	// the cached thread ID). The child code below and the RPC socket refresh
+	// in the loader both use the host allocator.
 	ret = native_fork();
-#elif defined(SYS_fork)
-	ret = LINUX_SYSCALL(__NR_fork);
-#else
-	ret = LINUX_SYSCALL(__NR_clone, LINUX_SIGCHLD, 0);
-#endif
 	if (ret < 0)
 		ret = errno_linux_to_bsd(ret);
 	else if (ret == 0)
@@ -83,6 +97,9 @@ long sys_fork(void)
 		// we don't need to close it ourselves.
 		// that should also take care of closing descriptors for any other threads.
 		guard_table_postfork_child();
+		nofile_limit_postfork_child();
+		bpf_device_postfork_child();
+		workq_postfork_child();
 
 		// create a new dserver RPC socket
 		__dserver_per_thread_socket_refresh();
@@ -113,11 +130,22 @@ long sys_fork(void)
 			__simple_printf("Failed to checkin with darlingserver after fork\n");
 			__simple_abort();
 		}
+		if (bsdthread_registered())
+			set_thread_handles(_pthread_getspecific_direct(_PTHREAD_TSD_SLOT_PTHREAD_SELF));
 		if (wdfd >= 0)
 			sys_fchdir(wdfd);
 
 		__dserver_close_process_lifetime_pipe(newReadFd);
 #endif
+	}
+	else
+	{
+		// The child inherits our special ports (e.g. the bootstrap port) when it
+		// checks in with darlingserver, so we must not return before that.
+		// Only a fork that created a child waits: no child checks in after a
+		// failed one.
+		while (dserver_rpc_fork_wait_for_child() == -LINUX_EINTR)
+			;
 	}
 
 	return ret;

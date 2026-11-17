@@ -9,6 +9,7 @@
 #include <darling/emulation/conversion/network/duct.h>
 #include <darling/emulation/conversion/duct_errno.h>
 #include <darling/emulation/xnu_syscall/bsd/helper/network/nosigpipe.h>
+#include <darling/emulation/xnu_syscall/bsd/helper/bpf/bpf_device.h>
 
 long sys_write(int fd, const void* mem, int len)
 {
@@ -26,6 +27,10 @@ long __write_for_xtrace(int fd, const void* mem, int len)
 long sys_write_nocancel(int fd, const void* mem, int len)
 {
 	int ret;
+	long bpf_ret;
+
+	if (bpf_device_fd_count && bpf_device_write(fd, mem, len, &bpf_ret))
+		return bpf_ret;
 
 	// A send with MSG_NOSIGNAL keeps SIGPIPE away from a socket that opted out of it.
 	if (nosigpipe_get(fd)) {

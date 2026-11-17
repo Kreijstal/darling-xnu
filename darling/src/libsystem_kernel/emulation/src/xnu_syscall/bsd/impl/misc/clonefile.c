@@ -1,128 +1,32 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/misc/clonefile.h>
 
 #include <sys/errno.h>
+#include <sys/stat.h>
+#include <sys/syslimits.h>
+#include <sys/time.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <string.h>
+#include <time.h>
 
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/conversion/common_at.h>
 #include <darling/emulation/conversion/errno.h>
 #include <darling/emulation/conversion/fcntl/open.h>
-#include <darling/emulation/conversion/stat/common.h>
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
 #include <darling/emulation/linux_premigration/vchroot_expand.h>
-
-extern char* strcpy(char* dst, const char* src);
-extern unsigned long strlen(const char* str);
-extern void* malloc(unsigned long size);
-extern void free(void* ptr);
-
-/* Linux's FS_IOC_FICLONE: _IOW(0x94, 9, int). */
-#define LINUX_FICLONE 0x40049409
-#define CLONE_NOFOLLOW 0x0001
-#define CLONE_NOOWNERCOPY 0x0002
-#define LINUX_S_IFMT 0170000
-#define LINUX_S_IFREG 0100000
-
-struct linux_clone_timespec {
-	long seconds;
-	long nanoseconds;
-};
-
-static long clone_xattrs(int source, int target) {
-	long size = LINUX_SYSCALL(__NR_flistxattr, source, 0, 0);
-	if (size <= 0)
-		return size;
-
-	char* names = malloc(size);
-	if (!names)
-		return -ENOMEM;
-	long count = LINUX_SYSCALL(__NR_flistxattr, source, names, size);
-	if (count < 0) {
-		free(names);
-		return count;
-	}
-
-	long result = 0;
-	for (long offset = 0; offset < count;) {
-		const char* name = names + offset;
-		unsigned long length = strlen(name) + 1;
-		if (length > (unsigned long)(count - offset)) {
-			result = -EIO;
-			break;
-		}
-		offset += length;
-		long value_size = LINUX_SYSCALL(__NR_fgetxattr, source, name, 0, 0);
-		if (value_size < 0) {
-			result = value_size;
-			break;
-		}
-		void* value = malloc(value_size ? value_size : 1);
-		if (!value) {
-			result = -ENOMEM;
-			break;
-		}
-		result = LINUX_SYSCALL(__NR_fgetxattr, source, name, value, value_size);
-		if (result >= 0)
-			result = LINUX_SYSCALL(__NR_fsetxattr, target, name, value, result, 0);
-		free(value);
-		if (result < 0)
-			break;
-	}
-	free(names);
-	return result;
-}
-
-static long clone_regular_file(int source, int dest_fd, const char* dest_path, uint32_t flags) {
-	struct linux_stat stat;
-	struct vchroot_expand_args dest;
-	long result, target;
-
-	result = LINUX_SYSCALL(__NR_fstat, source, &stat);
-	if (result < 0)
-		return errno_linux_to_bsd(result);
-	if ((stat.st_mode & LINUX_S_IFMT) != LINUX_S_IFREG)
-		return -ENOTSUP;
-
-	dest.flags = 0;
-	dest.dfd = atfd(dest_fd);
-	if (strlen(dest_path) >= sizeof(dest.path))
-		return -ENAMETOOLONG;
-	strcpy(dest.path, dest_path);
-	result = vchroot_expand(&dest);
-	if (result < 0)
-		return errno_linux_to_bsd(result);
-
-	/* O_EXCL implements clonefile's requirement that the target not exist. */
-	target = LINUX_SYSCALL(__NR_openat, dest.dfd, dest.path,
-		LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_EXCL | LINUX_O_CLOEXEC,
-		stat.st_mode & 0777);
-	if (target < 0)
-		return errno_linux_to_bsd(target);
-
-	result = LINUX_SYSCALL(__NR_ioctl, target, LINUX_FICLONE, source);
-	if (result >= 0 && !(flags & CLONE_NOOWNERCOPY)) {
-		/* Unprivileged callers get the ownership of a newly created file. */
-		long uid = LINUX_SYSCALL(__NR_geteuid);
-		if (uid == 0)
-			result = LINUX_SYSCALL(__NR_fchown, target, stat.st_uid, stat.st_gid);
-	}
-	if (result >= 0)
-		result = clone_xattrs(source, target);
-	if (result >= 0)
-		result = LINUX_SYSCALL(__NR_fchmod, target, stat.st_mode & 01777);
-	if (result >= 0) {
-		struct linux_clone_timespec times[2] = {
-			{ stat.st_atime, stat.st_atime_nsec },
-			{ stat.st_mtime, stat.st_mtime_nsec },
-		};
-		result = LINUX_SYSCALL(__NR_utimensat, target, "", times, LINUX_AT_EMPTY_PATH);
-	}
-	LINUX_SYSCALL(__NR_close, target);
-	if (result < 0) {
-		LINUX_SYSCALL(__NR_unlinkat, dest.dfd, dest.path, 0);
-		return errno_linux_to_bsd(result);
-	}
-	return 0;
-}
+#include <darling/emulation/other/mach/lkm.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/fcntl/fcntl.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/fcntl/open.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/fcntl/openat.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/stat/fstat.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/stat/mkdirat.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/time/futimes.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/unistd/close.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/unistd/fchmod.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/unistd/fchown.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/unistd/getuid.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/unistd/unlinkat.h>
 
 long sys_clonefileat(int src_fd, const char* src_path, int dest_fd, const char* dest_path, uint32_t flags) {
 	struct vchroot_expand_args src;
@@ -130,9 +34,10 @@ long sys_clonefileat(int src_fd, const char* src_path, int dest_fd, const char* 
 
 	if (!src_path || !dest_path)
 		return -EFAULT;
-	if (flags & ~(CLONE_NOFOLLOW | CLONE_NOOWNERCOPY))
+	if (flags & ~(XNU_CLONE_NOFOLLOW | XNU_CLONE_NOOWNERCOPY | XNU_CLONE_ACL |
+			XNU_CLONE_NOFOLLOW_ANY | XNU_CLONE_RESOLVE_BENEATH))
 		return -EINVAL;
-	src.flags = (flags & CLONE_NOFOLLOW) ? 0 : VCHROOT_FOLLOW;
+	src.flags = (flags & XNU_CLONE_NOFOLLOW) ? 0 : VCHROOT_FOLLOW;
 	src.dfd = atfd(src_fd);
 	if (strlen(src_path) >= sizeof(src.path))
 		return -ENAMETOOLONG;
@@ -142,18 +47,232 @@ long sys_clonefileat(int src_fd, const char* src_path, int dest_fd, const char* 
 		return errno_linux_to_bsd(result);
 	source = LINUX_SYSCALL(__NR_openat, src.dfd, src.path,
 		LINUX_O_RDONLY | LINUX_O_CLOEXEC |
-		((flags & CLONE_NOFOLLOW) ? LINUX_O_NOFOLLOW : 0), 0);
+		((flags & XNU_CLONE_NOFOLLOW) ? LINUX_O_NOFOLLOW : 0), 0);
 	if (source < 0)
 		return errno_linux_to_bsd(source);
-	result = clone_regular_file(source, dest_fd, dest_path, flags);
+	result = sys_fclonefileat(source, dest_fd, dest_path, flags);
 	LINUX_SYSCALL(__NR_close, source);
 	return result;
 }
 
 long sys_fclonefileat(int src_fd, int dest_fd, const char* dest_path, uint32_t flags) {
-	if (!dest_path)
-		return -EFAULT;
-	if (flags & ~(CLONE_NOFOLLOW | CLONE_NOOWNERCOPY))
-		return -EINVAL;
-	return clone_regular_file(src_fd, dest_fd, dest_path, flags);
+// On arm64, struct stat already has 64-bit inodes and struct stat64 is not available
+#if defined(__i386__) || defined(__aarch64__) || defined(__arm64__)
+    struct stat st;
+    long fstat_ret = sys_fstat(src_fd, &st);
+#else
+    struct stat64 st;
+    long fstat_ret = sys_fstat64(src_fd, &st);
+#endif
+
+    if (fstat_ret < 0) {
+        return fstat_ret;
+    }
+
+    if (!S_ISREG(st.st_mode)) {
+        return -EOPNOTSUPP;
+    }
+
+    if ((flags & XNU_CLONE_NOFOLLOW) && S_ISLNK(st.st_mode)) {
+        return -ENOTSUP;
+    }
+
+    if (flags & XNU_CLONE_NOFOLLOW_ANY) {
+#warning darling do not support XNU_CLONE_NOFOLLOW_ANY flag yet
+    }
+
+    if (flags & XNU_CLONE_ACL) {
+#warning darling do not support XNU_CLONE_ACL flag yet
+    }
+
+    if (flags & XNU_CLONE_RESOLVE_BENEATH) {
+#warning darling do not support XNU_CLONE_RESOLVE_BENEATH flag yet
+    }
+
+    int ret = 0;
+    int real_dest_fd = -1;
+    const char *filename = NULL;
+    char *filename_owned = NULL;
+    int dest_fd_owned = 0;
+
+    if (dest_fd == BSD_AT_FDCWD) {
+        dest_fd_owned = 1;
+        if (!dest_path || dest_path[0] == '\0') {
+            return -EINVAL;
+        }
+
+        char *path_buf = strdup(dest_path);
+
+        if (!path_buf) {
+            ret = -ENOMEM;
+            goto out_close;
+        }
+
+        char *path = path_buf;
+
+        if (path[0] == '/') {
+            dest_fd = sys_open_nocancel("/", BSD_O_RDONLY | BSD_O_DIRECTORY | BSD_O_CLOEXEC, 0);
+
+            if (dest_fd < 0) {
+                ret = dest_fd;
+                free(path_buf);
+                goto out_close;
+            }
+
+            path++;
+        } else {
+            dest_fd = LINUX_AT_FDCWD;
+        }
+
+        char *token;
+        int has_error = 0;
+
+        while ((token = strsep(&path, "/")) != NULL) {
+            if (*token == '\0') continue;
+
+            int next_fd = sys_openat_nocancel(dest_fd, token, BSD_O_RDONLY | BSD_O_DIRECTORY | BSD_O_CLOEXEC, st.st_mode & 0777);
+
+            if (next_fd >= 0) {
+                if (dest_fd != LINUX_AT_FDCWD) sys_close_nocancel(dest_fd);
+
+                dest_fd = next_fd;
+                continue;
+            }
+
+            if (path == NULL) {
+                if (*token == '\0') {
+                    ret = -EINVAL;
+                    free(path_buf);
+                    goto out_close;
+                }
+
+                filename_owned = strdup(token);
+                free(path_buf);
+
+                if (!filename_owned) {
+                    ret = -ENOMEM;
+                    goto out_close;
+                }
+
+                filename = filename_owned;
+                break;
+            }
+
+            if (next_fd < 0) {
+                ret = next_fd;
+                free(path_buf);
+                goto out_close;
+            }
+        }
+
+        if (!filename) {
+            /* dest_path had no trailing component (e.g. "/" or "a/") */
+            ret = -EISDIR;
+            goto out_close;
+        }
+    } else {
+        filename = dest_path;
+    }
+
+    real_dest_fd = sys_openat_nocancel(dest_fd, filename, BSD_O_CREAT | BSD_O_WRONLY | BSD_O_EXCL, 0644);
+
+    if (real_dest_fd < 0) {
+        ret = real_dest_fd;
+        real_dest_fd = -1;
+        goto out_close;
+    }
+
+    if (st.st_size > 0) {
+        size_t remaining = (size_t)st.st_size;
+
+        while (remaining > 0) {
+            long copy_ret = LINUX_SYSCALL(__NR_copy_file_range, src_fd, NULL, real_dest_fd, NULL, remaining, 0);
+
+            if (copy_ret < 0) {
+                ret = errno_linux_to_bsd(copy_ret);
+                goto out_close;
+            }
+
+            if (copy_ret == 0) {
+                break;
+            }
+
+            size_t copied = (size_t)copy_ret;
+
+            if (copied > remaining) {
+                remaining = 0;
+            } else {
+                remaining -= copied;
+            }
+        }
+    }
+
+    if (!(flags & XNU_CLONE_NOOWNERCOPY)) {
+        long current_uid = sys_getuid();
+
+        if (current_uid != 0 && current_uid != st.st_uid) {
+            ret = -EPERM;
+            goto out_close;
+        }
+
+        long chown_ret = sys_fchown(real_dest_fd, st.st_uid, st.st_gid);
+
+        if (chown_ret < 0) {
+            ret = chown_ret;
+            goto out_close;
+        }
+    }
+
+    long chmod_ret = sys_fchmod(real_dest_fd, st.st_mode & 07777);
+
+    if (chmod_ret < 0) {
+        ret = chmod_ret;
+        goto out_close;
+    }
+
+    // copy_file_range doesn't preserve timestamps, so we need to explicitly
+    // set them to match the source file's atime and mtime
+    struct timespec times[2];
+    times[0] = st.st_atimespec;
+    times[1] = st.st_mtimespec;
+    struct bsd_timeval tv[2];
+    tv[0] = (struct bsd_timeval){
+        .tv_sec = times[0].tv_sec,
+        .tv_usec = times[0].tv_nsec / 1000,
+    };
+    tv[1] = (struct bsd_timeval){
+        .tv_sec = times[1].tv_sec,
+        .tv_usec = times[1].tv_nsec / 1000,
+    };
+    long times_ret = sys_futimes(real_dest_fd, tv);
+
+    if (times_ret < 0) {
+        ret = times_ret;
+        goto out_close;
+    }
+
+out_close:
+    {
+        if (real_dest_fd >= 0) {
+            if (ret == 0) {
+                long close_ret = sys_close_nocancel(real_dest_fd);
+
+                if (close_ret < 0) {
+                    ret = close_ret;
+                }
+            } else {
+                long unlinkat_ret = sys_unlinkat(dest_fd, filename, 0);
+
+                if (unlinkat_ret < 0) {
+                    ret = unlinkat_ret;
+                }
+            }
+        }
+
+        if (dest_fd_owned && dest_fd >= 0) sys_close_nocancel(dest_fd);
+
+        free(filename_owned);
+    }
+
+    return ret;
 }

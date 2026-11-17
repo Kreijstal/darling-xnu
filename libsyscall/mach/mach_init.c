@@ -145,16 +145,8 @@ _mach_fork_child(void)
 
 #ifdef DARLING
 int _mach_fork_parent(void) {
-	int result;
-
-retry:
-	result = dserver_rpc_fork_wait_for_child();
-	if (result < 0) {
-		if (result == -LINUX_EINTR) {
-			goto retry;
-		}
-		__builtin_unreachable();
-	}
+	// fork() itself waits for the child to check in with darlingserver,
+	// and only if it created one (see sys_fork())
 	return 0;
 };
 #endif
@@ -191,12 +183,6 @@ mach_init_doit(void)
 	// Initialize cached mach ports defined in mach_init.h
 	mach_task_self_ = task_self_trap();
 	_task_reply_port = mach_reply_port();
-	if (bootstrap_port == MACH_PORT_NULL) {
-		kern_return_t kr = task_get_special_port(mach_task_self_, TASK_BOOTSTRAP_PORT, &bootstrap_port);
-		if (kr != KERN_SUCCESS) {
-			bootstrap_port = MACH_PORT_NULL;
-		}
-	}
 
 	if (vm_kernel_page_shift == 0) {
 #if defined(__x86_64__) || defined(__i386__)

@@ -25,4 +25,12 @@ ssize_t _recvmsg_raw_4libkqueue(int fd, struct msghdr* msg, int flags);
 VISIBLE
 ssize_t _send_raw_4libkqueue(int fd, const void* buf, size_t len);
 
+// Counts each delivery of the BSD signal on the eventfd, whichever thread
+// takes the signal and whatever its disposition. Returns 0 or a negative errno.
+VISIBLE
+int _signal_watch_4libkqueue(int signum, int eventfd);
+
+VISIBLE
+void _signal_unwatch_4libkqueue(int signum, int eventfd);
+
 #endif // _DARLING_EMULATION_FOR_LIBKQUEUE_H_

@@ -3,12 +3,14 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/errno.h>
 #include <sys/signal.h>
 #include <sys/mman.h>
 #include <mach/vm_page_size.h>
 #include <_libkernel_init.h>
 
 #include <darling/emulation/xnu_syscall/bsd/impl/signal/sigaction.h>
+#include <darling/emulation/conversion/signal/duct_signals.h>
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/exit.h>
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
@@ -17,11 +19,13 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/mman/mman.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/signal/kill.h>
 #include <darling/emulation/common/simple.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/bsdthread/pthread_canceled.h>
 #include <darling/emulation/common/tsd.h>
 #include <darling/emulation/xnu_syscall/machdep/impl/tls.h>
 #include <darling/emulation/xnu_syscall/bsd/bsd_syscall_table.h>
 #include <darling/emulation/xnu_syscall/mach/mach_syscall_table.h>
 #include <mach/message.h>
+#include <darling/emulation/linux_premigration/signal/tsd_trap.h>
 
 #include <darlingserver/rpc.h>
 
@@ -81,7 +85,8 @@ static void float_state_to_mcontext(const arm_neon_state64_t_linux* s, unsigned 
 static void state_from_kernel(struct linux_ucontext* ctxt, const void* tstate, const void* fstate);
 static void state_to_kernel(struct linux_ucontext* ctxt, void* tstate, void* fstate);
 
-#define DEBUG_SIGEXC
+// Each kern_printf is a darlingserver request, and a handled signal makes
+// dozens of them (register dumps included). Build with -DDEBUG_SIGEXC to trace.
 #ifdef DEBUG_SIGEXC
 #define kern_printf(...) __simple_kprintf(__VA_ARGS__)
 #else
@@ -158,7 +163,7 @@ void sigexc_setup(void)
 		}
 		if (tracer != 0) {
 			kern_printf("sigexc: already traced -> SIGTRAP\n");
-			sys_kill(0, SIGTRAP, 0);
+			sys_kill(getpid(), SIGTRAP, 0);
 		}
 	}
 #else
@@ -194,6 +199,17 @@ static void rpc_failed_in_handler(const char* what, int status)
 	__simple_abort();
 }
 
+static void cancel_interrupted_syscall(struct linux_ucontext* ctxt)
+{
+#if defined(__x86_64__)
+	ctxt->uc_mcontext.gregs.rip = pthread_cancelable_syscall_interrupted(ctxt->uc_mcontext.gregs.rip);
+#elif defined(__i386__)
+	ctxt->uc_mcontext.gregs.eip = pthread_cancelable_syscall_interrupted(ctxt->uc_mcontext.gregs.eip);
+#elif defined(__aarch64__) || defined(__arm64__)
+	ctxt->uc_mcontext.gregs.pc = pthread_cancelable_syscall_interrupted(ctxt->uc_mcontext.gregs.pc);
+#endif
+}
+
 void sigrt_handler(int signum, struct linux_siginfo* info, struct linux_ucontext* ctxt)
 {
 
@@ -226,6 +242,10 @@ void sigrt_handler(int signum, struct linux_siginfo* info, struct linux_ucontext
 	}
 
 	state_from_kernel(ctxt, &tstate, &fstate);
+
+	// darlingserver also sends this signal to interrupt a cancelable syscall
+	// when it marks the thread for cancellation
+	cancel_interrupted_syscall(ctxt);
 	} else if (signum == SIGNAL_S2C) {
 		__simple_kprintf("sigexc: sigrt_handler S2C");
 
@@ -333,21 +353,166 @@ static void state_from_kernel(struct linux_ucontext* ctxt, const void* tstate, c
 #endif
 }
 
-#if defined(__aarch64__) || defined(__arm64__)
-// Private dyld/kernel ABI: UDF #0xda00..0xda1f replaces a cached Darwin
-// MRS TPIDRRO_EL0. The low five bits name Xd (31 means XZR). Linux owns
-// TPIDR_EL0; returning it here would expose and corrupt native ELF TLS.
-static bool emulate_darling_tsd_read(struct linux_ucontext* ctxt)
+// Whether the kernel raised this signal for a fault in the current thread.
+// Such a signal can only be handled by the thread that caused it.
+static bool is_thread_fault(int linux_signum, const struct linux_siginfo* info)
 {
-    struct linux_gregset* regs = &ctxt->uc_mcontext.gregs;
-    const uint32_t instruction = *(const uint32_t*)regs->pc;
-    if ( (instruction & 0xFFFFFFE0U) != 0x0000DA00U )
-        return false;
-    const uint32_t destination = instruction & 0x1FU;
-    if ( destination != 31 )
-        regs->regs[destination] = (uintptr_t)sys_thread_get_tsd_base();
-    regs->pc += sizeof(instruction);
-    return true;
+	if (info == NULL || info->si_code <= 0)
+		return false; // sent by a process, not raised by the kernel
+
+	switch (linux_signum)
+	{
+		case LINUX_SIGSEGV:
+		case LINUX_SIGBUS:
+		case LINUX_SIGILL:
+		case LINUX_SIGFPE:
+		case LINUX_SIGTRAP:
+		case LINUX_SIGSYS:
+			return true;
+		default:
+			return false;
+	}
+}
+
+// kqueue signal filters (EVFILT_SIGNAL) count every attempt to deliver a
+// signal to the process, whatever the signal's disposition (including
+// SIG_IGN) and whichever thread takes it. A signal that reaches a handler here
+// is gone before a signalfd could see it, so libkqueue registers an eventfd
+// for each signal filter and every such signal is counted on those eventfds.
+#define SIGEXC_KQUEUE_WATCHERS 16
+
+// A slot holds an eventfd plus one; zero means free.
+static int kqueue_watchers[32][SIGEXC_KQUEUE_WATCHERS];
+// Number of threads currently writing to the eventfds above.
+static int kqueue_notifiers;
+
+int sigexc_kqueue_watch(int linux_signum, int fd)
+{
+	if (linux_signum <= 0 || linux_signum >= 32 || fd < 0)
+		return -EINVAL;
+
+	for (int i = 0; i < SIGEXC_KQUEUE_WATCHERS; i++)
+	{
+		int expected = 0;
+		if (__atomic_compare_exchange_n(&kqueue_watchers[linux_signum][i], &expected, fd + 1,
+				false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+			return 0;
+	}
+	return -ENOSPC;
+}
+
+void sigexc_kqueue_unwatch(int linux_signum, int fd)
+{
+	if (linux_signum <= 0 || linux_signum >= 32 || fd < 0)
+		return;
+
+	for (int i = 0; i < SIGEXC_KQUEUE_WATCHERS; i++)
+	{
+		int expected = fd + 1;
+		if (__atomic_compare_exchange_n(&kqueue_watchers[linux_signum][i], &expected, 0,
+				false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+			break;
+	}
+
+	// The caller closes the eventfd next. Wait until no thread can still be
+	// writing to it, so that a reused descriptor never receives a count.
+	// The writers run with standard signals blocked and never wait, so this
+	// cannot spin on a writer interrupted on the same thread.
+	while (__atomic_load_n(&kqueue_notifiers, __ATOMIC_ACQUIRE) != 0)
+		LINUX_SYSCALL0(__NR_sched_yield);
+}
+
+static void sigexc_kqueue_notify(int linux_signum)
+{
+	static const uint64_t one = 1;
+
+	if (linux_signum <= 0 || linux_signum >= 32)
+		return;
+
+	__atomic_add_fetch(&kqueue_notifiers, 1, __ATOMIC_ACQ_REL);
+	for (int i = 0; i < SIGEXC_KQUEUE_WATCHERS; i++)
+	{
+		int slot = __atomic_load_n(&kqueue_watchers[linux_signum][i], __ATOMIC_ACQUIRE);
+		if (slot != 0)
+			LINUX_SYSCALL(__NR_write, slot - 1, &one, sizeof(one));
+	}
+	__atomic_sub_fetch(&kqueue_notifiers, 1, __ATOMIC_ACQ_REL);
+}
+
+#define SIGEXC_SI_TKILL (-6)
+
+// The signal arrived on a thread that cannot talk to darlingserver: one that
+// was not created as a Darwin thread (it never had a connection), or any
+// thread once the server is gone. The signal cannot be processed here.
+static void handle_signal_without_server(int linux_signum, struct linux_siginfo* info, struct linux_ucontext* ctxt)
+{
+	int pid = LINUX_SYSCALL0(__NR_getpid);
+	int tid = LINUX_SYSCALL0(__NR_gettid);
+
+	// A signal sent to the process may be handled by any of its threads.
+	// Keep it blocked on this thread once the handler returns and send it to
+	// the process again, so that a thread that can process it takes it (or it
+	// stays pending until one can). A signal sent to this very thread cannot
+	// be processed here either, so it is passed on to the process the same way.
+	if (!is_thread_fault(linux_signum, info) && tid != pid && info != NULL && ctxt != NULL)
+	{
+		long requeued;
+
+		ctxt->uc_sigmask |= (1ull << (linux_signum - 1));
+
+		// The kernel lets a thread other than the main one use rt_sigqueueinfo() only for signals
+		// that carry data (sigqueue(), timers, ...): it refuses the siginfo of kill() and tgkill()
+		// (SI_USER and SI_TKILL), which have to be sent again with kill().
+		if (info->si_code < 0 && info->si_code != SIGEXC_SI_TKILL)
+			requeued = LINUX_SYSCALL(__NR_rt_sigqueueinfo, pid, linux_signum, info);
+		else
+			requeued = LINUX_SYSCALL(__NR_kill, pid, linux_signum);
+
+		if (requeued == 0)
+			return;
+		ctxt->uc_sigmask &= ~(1ull << (linux_signum - 1));
+	}
+
+	// Otherwise apply the default action, as if no handler were installed.
+	// Returning from a fault handler would just fault again.
+	struct linux_sigaction sa;
+	sa.sa_sigaction = (linux_sig_handler*) NULL; // SIG_DFL
+	sa.sa_mask = 0;
+	sa.sa_flags = LINUX_SA_RESTORER | LINUX_SA_SIGINFO;
+	sa.sa_restorer = sig_restorer;
+
+	LINUX_SYSCALL(__NR_rt_sigaction, linux_signum, &sa, NULL, sizeof(sa.sa_mask));
+
+	linux_sigset_t unblock = (1ull << (linux_signum - 1));
+	LINUX_SYSCALL(__NR_rt_sigprocmask, 1 /* LINUX_SIG_UNBLOCK */,
+			&unblock, NULL, sizeof(linux_sigset_t));
+
+	LINUX_SYSCALL(__NR_tgkill, pid, tid, linux_signum);
+}
+
+unsigned long sigexc_handlers_run(void)
+{
+	return (unsigned long)(uintptr_t)_pthread_getspecific_direct(__PTK_DARLING_SIGNAL_HANDLERS_RUN);
+}
+
+#if defined(__aarch64__) || defined(__arm64__)
+// Emulates the Darling-private TSD read trap (see tsd_trap.h) that dyld leaves
+// in place of a Darwin TPIDRRO_EL0 read. Linux owns TPIDR_EL0; returning it
+// here would expose and corrupt native ELF TLS.
+static bool emulate_darling_tsd_read(const struct linux_siginfo* info, struct linux_ucontext* ctxt)
+{
+	struct linux_gregset* regs = &ctxt->uc_mcontext.gregs;
+	// Only a synchronous undefined-instruction trap at the saved PC: the
+	// instruction word is not read for any other SIGILL.
+	if (info->si_code != 1 /* ILL_ILLOPC */ || (uintptr_t)info->si_addr != (uintptr_t)regs->pc)
+		return false;
+	uint32_t destination;
+	if (!darling_tsd_trap_decode(*(const uint32_t*)regs->pc, &destination))
+		return false;
+	if (destination != 31)
+		regs->regs[destination] = (uintptr_t)sys_thread_get_tsd_base();
+	regs->pc += sizeof(uint32_t);
+	return true;
 }
 
 // Code that calls the kernel itself, with SVC #0x80 and the Darwin number in x16
@@ -451,16 +616,14 @@ static bool leave_darling_svc(struct linux_ucontext* ctxt)
 void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_ucontext* ctxt)
 {
 #if defined(__aarch64__) || defined(__arm64__)
-    // Consume the emulated register read before RPC and Mach exception delivery.
-    if ( linux_signum == LINUX_SIGILL && info && info->si_code > 0
-            && emulate_darling_tsd_read(ctxt) )
-        return;
-    if ( linux_signum == LINUX_SIGILL && info && info->si_code > 0
-            && leave_darling_svc(ctxt) )
-        return;
-    if ( linux_signum == LINUX_SIGSYS && info && info->si_code == 1 /* SYS_SECCOMP */
-            && enter_darling_svc(ctxt) )
-        return;
+	// Consume the emulated register read before RPC and Mach exception delivery.
+	if (linux_signum == LINUX_SIGILL && info && emulate_darling_tsd_read(info, ctxt))
+		return;
+	if (linux_signum == LINUX_SIGILL && info && info->si_code > 0 && leave_darling_svc(ctxt))
+		return;
+	if (linux_signum == LINUX_SIGSYS && info && info->si_code == 1 /* SYS_SECCOMP */
+			&& enter_darling_svc(ctxt))
+		return;
 #endif
 	// Re-entrancy guard. The first thing this handler does is enter a server RPC,
 	// which takes duct-tape mutexes. A thread running inside a signal handler has
@@ -531,10 +694,17 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 	int status = dserver_rpc_interrupt_enter();
 
 	if (status != 0) {
-		rpc_failed_in_handler("dserver_rpc_interrupt_enter", status);
+		handle_signal_without_server(linux_signum, info, ctxt);
+		_pthread_setspecific_direct(__PTK_DARLING_SIGEXC_SIGNAL,
+				(void*)(uintptr_t)in_sigexc_handler_signal);
+		return;
 	}
 
+	if (!is_thread_fault(linux_signum, info))
+		sigexc_kqueue_notify(linux_signum);
+
 	kern_printf("sigexc_handler(%d, %p, %p)\n", linux_signum, info, ctxt);
+
 
 	// DARLING-DBG: capture SIGSYS details (bad syscall number, code, call addr)
 	if (linux_signum == LINUX_SIGSYS && info)
@@ -655,7 +825,10 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 			kern_printf("sigexc: will forward signal to app handler (%p)\n", sig_handlers[linux_signum]);
 
 			// Update the signal mask to what the application actually wanted
-			linux_sigset_t set = sig_masks[linux_signum];
+			// sig_masks holds the Darwin-numbered mask given to sigaction()
+			sigset_t bsd_mask = sig_masks[linux_signum];
+			linux_sigset_t set;
+			sigset_bsd_to_linux(&bsd_mask, &set);
 
 			// Keep the current signal blocked, which is the default behavior
 			if (!(sig_flags[linux_signum] & LINUX_SA_NODEFER))
@@ -664,14 +837,28 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 			LINUX_SYSCALL(__NR_rt_sigprocmask, 2 /* LINUX_SIG_SETMASK */,
 				&set, NULL, sizeof(linux_sigset_t));
 
+			// The guard covers only Darling's own handler code. The
+			// application's handler may fault on purpose (and handle that
+			// fault with its own SIGSEGV handler), as it can on macOS, so
+			// lift the guard while it runs and put it back afterwards.
+			int guard_signal = (int)(uintptr_t)
+					_pthread_getspecific_direct(__PTK_DARLING_SIGEXC_SIGNAL);
+			_pthread_setspecific_direct(__PTK_DARLING_SIGEXC_SIGNAL, (void*)0);
+
+			_pthread_setspecific_direct(__PTK_DARLING_SIGNAL_HANDLERS_RUN,
+					(void*)((uintptr_t)_pthread_getspecific_direct(__PTK_DARLING_SIGNAL_HANDLERS_RUN) + 1));
+
 			handler_linux_to_bsd(linux_signum, info, ctxt);
+
+			_pthread_setspecific_direct(__PTK_DARLING_SIGEXC_SIGNAL,
+					(void*)(uintptr_t)guard_signal);
 		}
 		else
 		{
 			if (bsd_signum == SIGTSTP || bsd_signum == SIGSTOP)
 			{
 				kern_printf("sigexc: emulating SIGTSTP/SIGSTOP\n");
-				LINUX_SYSCALL(__NR_kill, 0, LINUX_SIGSTOP);
+				LINUX_SYSCALL(__NR_kill, LINUX_SYSCALL0(__NR_getpid), LINUX_SIGSTOP);
 			}
 			else
 			{

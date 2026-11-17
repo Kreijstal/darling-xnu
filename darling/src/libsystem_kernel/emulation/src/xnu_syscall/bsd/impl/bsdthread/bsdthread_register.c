@@ -5,6 +5,7 @@
 #include <pthread/tsd_private.h>
 
 #include <darling/emulation/common/base.h>
+#include <darling/emulation/common/tsd.h>
 #include <darling/emulation/conversion/errno.h>
 #include <darling/emulation/linux_premigration/signal/sigexc.h>
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
@@ -33,6 +34,35 @@ struct _pthread_registration_data {
 } __attribute__ ((packed));
 
 static struct _pthread_registration_data g_pth_regdata;
+static bool g_registered = false;
+
+bool bsdthread_registered(void)
+{
+	return g_registered;
+}
+
+static uintptr_t* cancel_marked_slot(uintptr_t pthread_handle)
+{
+	uintptr_t tsd = pthread_handle + g_pth_regdata.tsd_offset;
+	return (uintptr_t*) tsd + __PTK_DARLING_CANCEL_MARKED;
+}
+
+uintptr_t* bsdthread_cancel_marked_slot(void)
+{
+	return cancel_marked_slot(_pthread_getspecific_direct(_PTHREAD_TSD_SLOT_PTHREAD_SELF));
+}
+
+void set_thread_handles(uintptr_t pthread_handle)
+{
+	uintptr_t tsd = pthread_handle + g_pth_regdata.tsd_offset;
+	uintptr_t dispatch_qaddr = tsd + g_pth_regdata.dispatch_queue_offset;
+	uintptr_t* cancel_marked = cancel_marked_slot(pthread_handle);
+
+	*cancel_marked = 0;
+	if (dserver_rpc_set_thread_handles(pthread_handle, dispatch_qaddr, (uintptr_t) cancel_marked) < 0) {
+		__simple_abort();
+	}
+}
 
 long sys_bsdthread_register(void* thread_start, void* wqthread, int pthsize,
 		const struct _pthread_registration_data* pth_regdata,
@@ -43,11 +73,10 @@ long sys_bsdthread_register(void* thread_start, void* wqthread, int pthsize,
 	wqueue_entry_point = (bsdwqthread_entry_t) wqthread;
 	g_pth_regdata = *pth_regdata;
 
-	uintptr_t pthread_handle = _pthread_getspecific_direct(_PTHREAD_TSD_SLOT_PTHREAD_SELF);
-	uintptr_t dispatch_qaddr = pthread_handle + g_pth_regdata.tsd_offset + g_pth_regdata.dispatch_queue_offset;
-	if (dserver_rpc_set_thread_handles(pthread_handle, dispatch_qaddr) < 0) {
-		__simple_abort();
-	}
+	set_thread_handles(_pthread_getspecific_direct(_PTHREAD_TSD_SLOT_PTHREAD_SELF));
+
+	// libpthread has set up the TSD of this thread, and it does so for every thread it creates later
+	g_registered = true;
 
 	return /* WORKQ_FEATURE_KEVENT | WORKQ_FEATURE_FINEPRIO | PTHREAD_FEATURE_QOS_MAINTENANCE 
 		| PTHREAD_FEATURE_DISPATCHFUNC | PTHREAD_FEATURE_QOS_DEFAULT */ 0;
@@ -61,11 +90,7 @@ void pthread_entry_point_wrapper(void* self, int thread_port, void* funptr,
 {
 	sigexc_thread_setup();
 
-	uintptr_t pthread_handle = (unsigned long) self;
-	uintptr_t dispatch_qaddr = pthread_handle + g_pth_regdata.tsd_offset + g_pth_regdata.dispatch_queue_offset;
-	if (dserver_rpc_set_thread_handles(pthread_handle, dispatch_qaddr) < 0) {
-		__simple_abort();
-	}
+	set_thread_handles((uintptr_t) self);
 
 	// No additional function calls should occur beyond this point. Otherwise, we will risk our
 	// registers being call-clobbered. I recommend reading the following doc for more details:
@@ -177,6 +202,11 @@ void wqueue_entry_point_asm_jump(void* self, int thread_port, void* stackaddr,
 		// `_start_wqthread` does not expect the stack to be aligned (using the
 		// call instruction will add the return address to the stack, causing
 		// it to be aligned).
+		// The kernel enters a workqueue thread on an empty stack, including when reusing one.
+		// self sits right above the usable stack. Without this, every reuse of a thread
+		// keeps the frames of the syscall that parked it, until the stack overflows.
+		"movq %%rdi, %%rsp\n"
+		"xorq %%rbp, %%rbp\n"
 		"jmpq *%[wqueue_entry_point]\n"
 		::
 		// Arguments follow the usual x86_64 calling conventions.
@@ -185,13 +215,25 @@ void wqueue_entry_point_asm_jump(void* self, int thread_port, void* stackaddr,
 	);
 #elif __i386__
 	__asm__ __volatile__ (
-		// `_start_wqthread` does not expect the stack to be aligned.
-		"jmpl *%[wqueue_entry_point]\n"
+		// As on x86_64, the kernel enters a workqueue thread on an empty stack whose top
+		// is self, which is 16-byte aligned. `_start_wqthread` relies on that alignment
+		// to keep every frame below it aligned. The frame of this function is not
+		// aligned when it is called from `workq_kernreturn` on a reused thread, and SSE
+		// spills to the stack then fault with SIGSEGV. Staying on this stack would also
+		// leak the frames of the syscall that parked the thread.
+		// All general purpose registers but ebp carry arguments, and the entry point may
+		// be addressed relative to esp or ebp, so it is copied to the top of the new
+		// stack while the old one is still current, and entered with ret.
+		"pushl %[wqueue_entry_point]\n"
+		"popl -4(%[self])\n"
+		"leal -4(%[self]), %%esp\n"
+		"xorl %%ebp, %%ebp\n"
+		"ret\n"
 		::
 		// `_start_wqthread` does not follow the i386 calling conventions
 		// for arguments. Instead of storing the arguments into the stack,
 		// the arguments are stored in the registers.
-		"r"(arg1),"r"(arg2),"r"(arg3),"r"(arg4),"r"(arg5),"r"(arg6),
+		[self] "r"(arg1),"r"(arg2),"r"(arg3),"r"(arg4),"r"(arg5),"r"(arg6),
 		[wqueue_entry_point] "rmi"(wqueue_entry_point)
 	);
 #elif defined(__aarch64__) || defined(__arm64__)

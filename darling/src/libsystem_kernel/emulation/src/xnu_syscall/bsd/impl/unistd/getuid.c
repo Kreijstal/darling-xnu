@@ -62,10 +62,11 @@ long __setuidgid(int32_t uid, int32_t gid) {
 	// see note about impossibility of deadlocks in __getuidgid
 	ret = dserver_rpc_uidgid(uid, gid, NULL, NULL);
 	if (ret == 0) {
-		if (uid >= 0) {
+		// only -1 means "unchanged"; other negative values are real ids (e.g. -2 is `nobody`)
+		if (uid != -1) {
 			stored_uid = uid;
 		}
-		if (gid >= 0) {
+		if (gid != -1) {
 			stored_gid = gid;
 		}
 	} else {
@@ -80,5 +81,7 @@ long sys_getuid(void)
 {
 	int32_t uid;
 	__getuidgid(&uid, NULL);
-	return uid;
+	// uid_t/gid_t are unsigned: return the value zero-extended, so that
+	// ids such as -2 (nobody) are not taken for -errno.
+	return (uint32_t) uid;
 }

@@ -34,14 +34,22 @@
 #include <darling/emulation/xnu_syscall/bsd/helper/misc/sysctl_proc.h>
 #include <darling/emulation/linux_premigration/elfcalls_wrapper.h>
 #include <darling/emulation/xnu_syscall/bsd/helper/misc/readline.h>
+#include <darling/emulation/conversion/common_at.h>
+#include <darling/emulation/conversion/stat/common.h>
+#include <darling/emulation/conversion/duct_errno.h>
 
 #include <darlingserver/rpc.h>
 
 #define LINUX_PR_SET_NAME 15
 
+// glibc bits/confname.h, for native_sysconf()
+#define LINUX_SC_CLK_TCK 2
+#define LINUX_SC_PAGESIZE 30
+
 static long _proc_pidinfo(int32_t pid, uint32_t flavor, uint64_t arg, void* buffer, int32_t bufsize);
 static long _proc_pidinfo_pidrusage(int32_t pid, uint32_t flavor, void* buffer, int32_t bufsize);
 static long _proc_pidinfo_vnodepathinfo(int32_t pid, void* buffer, int32_t bufsize);
+static long _proc_pidfdinfo(int32_t pid, uint32_t flavor, int fd, void* buffer, int32_t bufsize);
 static long _proc_listpids(uint32_t type, uint32_t typeinfo, void* buffer, int32_t bufsize);
 
 extern __SIZE_TYPE__ strlen(const char *s);
@@ -50,6 +58,7 @@ extern void *memcpy(void *dest, const void *src, __SIZE_TYPE__ n);
 extern char *strcpy(char *dest, const char *src);
 extern char *strncpy(char *dest, const char *src, __SIZE_TYPE__ n);
 extern int strncmp (const char * str1, const char * str2, __SIZE_TYPE__ num);
+extern char *strchr(char *str, int character);
 extern void* malloc(__SIZE_TYPE__ len);
 extern void free(void* ptr);
 extern int _sysctl_proc(int what, int flag, struct kinfo_proc* out, unsigned long* buflen);
@@ -98,6 +107,7 @@ long sys_proc_info(uint32_t callnum, int32_t pid, uint32_t flavor,
 			// `pid` carries the type, `flavor` the typeinfo (pgid, ppid, uid...)
 			return _proc_listpids(pid, flavor, buffer, bufsize);
 		case 3: // proc_pidfdinfo
+			return _proc_pidfdinfo(pid, flavor, (int) arg, buffer, bufsize);
 		default:
 			__simple_fprintf(2, "sys_proc_info(): Unsupported callnum: %d\n",
 					callnum);
@@ -269,8 +279,6 @@ long _proc_pidinfo(int32_t pid, uint32_t flavor, uint64_t arg, void* buffer, int
 	}
 }
 
-static char fakeuuid[16];
-
 static long _proc_pidonfo_uniqinfo(int32_t pid, void* buffer, int32_t bufsize)
 {
 #ifndef VARIANT_DYLD
@@ -283,12 +291,17 @@ static long _proc_pidonfo_uniqinfo(int32_t pid, void* buffer, int32_t bufsize)
 	struct proc_uniqidentifierinfo* info = (struct proc_uniqidentifierinfo*) buffer;
 
 	if (bufsize < sizeof(*info))
-		return -ENOSPC;
+		return -ENOMEM;
 
 	memset(buffer, 0, bufsize);
 
-#warning Get UUID from kernel
-	memcpy(info->p_uuid, fakeuuid, sizeof(info->p_uuid));
+	// p_uuid is the LC_UUID of the target's main executable, which the loader
+	// recorded with darlingserver when it started the image
+	int uuid_rv = dserver_rpc_get_executable_uuid(pid, info->p_uuid);
+	if (uuid_rv > 0)
+		return -uuid_rv; // ESRCH: no such process
+	if (uuid_rv < 0)
+		memset(info->p_uuid, 0, sizeof(info->p_uuid));
 
 	//////////////////////////
 	// Read info for pid    //
@@ -321,6 +334,11 @@ static long _proc_pidonfo_uniqinfo(int32_t pid, void* buffer, int32_t bufsize)
 	// Read info for ppid   //
 	//////////////////////////
 
+	if (ppid == 0) {
+		// A parent outside this PID namespace is reported as zero.
+		info->p_puniqueid = 0;
+		return sizeof(*info);
+	}
 	__simple_sprintf(path, "/proc/%d/stat", ppid);
 	if (!read_string(path, stat, sizeof(stat)))
 		return -ESRCH;
@@ -336,19 +354,20 @@ static long _proc_pidonfo_uniqinfo(int32_t pid, void* buffer, int32_t bufsize)
 	info->p_puniqueid = starttime << 16;
 	info->p_puniqueid |= (ppid & 0xffff);
 
+	// proc_pidinfo reports bytes copied, not a boolean success value.
+	return sizeof(*info);
+#else
+	// This variant does not populate the output structure.
+	return -ENOTSUP;
 #endif
-	return 1;
 }
-
-// glibc bits/confname.h
-#define _SC_CLK_TCK 2
 
 static long _proc_pidinfo_tbsdinfo(int32_t pid, void* buffer, int32_t bufsize)
 {
 	struct proc_bsdinfo* info = (struct proc_bsdinfo*) buffer;
 
 	if (bufsize < sizeof(*info))
-		return -ENOSPC;
+		return -ENOMEM;
 
 	struct proc_bsdshortinfo shortinfo;
 	int err = _proc_pidinfo_shortbsdinfo(pid, &shortinfo, sizeof(shortinfo));
@@ -391,40 +410,12 @@ static long _proc_pidinfo_tbsdinfo(int32_t pid, void* buffer, int32_t bufsize)
 
 	uint64_t starttime = __simple_atoi(elem, NULL);
 
-	struct rdline_buffer rbuf;
-	int statfd = sys_open("/proc/stat", BSD_O_RDONLY, 0);
-
-	if (statfd < 0)
+	uint64_t start_sec, start_usec;
+	if (!proc_start_time(starttime, &start_sec, &start_usec))
 		return -ESRCH;
 
-	_readline_init(&rbuf);
-
-	uint64_t btime;
-	const char* line = NULL;
-
-	while ((line = _readline(statfd, &rbuf)) != NULL)
-	{
-		if (strncmp(line, "btime ", 6) == 0)
-		{
-			line += 6;
-			btime = __simple_atoi(line, NULL);
-			break;
-		}
-	}
-
-	close_internal(statfd);
-
-	// if we see `line == NULL`, we didn't break out early, so we didn't see "btime"
-	if (line == NULL) {
-		return -ESRCH;
-	}
-
-	long ticks_per_sec = native_sysconf(_SC_CLK_TCK);
-	uint64_t starttime_secs = starttime / ticks_per_sec;
-	uint64_t starttime_usecs = (starttime % ticks_per_sec) * 1000000 / ticks_per_sec;
-
-	info->pbi_start_tvsec = btime + starttime_secs;
-	info->pbi_start_tvusec = starttime_usecs;
+	info->pbi_start_tvsec = start_sec;
+	info->pbi_start_tvusec = start_usec;
 
 	memcpy(info->pbi_comm, shortinfo.pbsi_comm, sizeof(info->pbi_comm));
 
@@ -442,7 +433,7 @@ static long _proc_pidinfo_pidthreadinfo(int32_t pid, uint64_t thread_handle, voi
 
 	struct proc_threadinfo* info = (struct proc_threadinfo*) buffer;
 	if (bufsize < sizeof(*info))
-		return -ENOSPC;
+		return -ENOMEM;
 
 	memset(buffer, 0, bufsize);
 
@@ -459,7 +450,7 @@ static long _proc_pidinfo_pidthreadinfo(int32_t pid, uint64_t thread_handle, voi
 	}
 
 	// TODO: Other proc_threadinfo fields
-	return 1;
+	return sizeof(*info);
 }
 
 static long _proc_pidinfo_shortbsdinfo(int32_t pid, void* buffer, int32_t bufsize)
@@ -472,7 +463,7 @@ static long _proc_pidinfo_shortbsdinfo(int32_t pid, void* buffer, int32_t bufsiz
 
 	struct proc_bsdshortinfo* info = (struct proc_bsdshortinfo*) buffer;
 	if (bufsize < sizeof(*info))
-		return -ENOSPC;
+		return -ENOMEM;
 
 	memset(buffer, 0, bufsize);
 
@@ -536,7 +527,7 @@ static long _proc_pidinfo_shortbsdinfo(int32_t pid, void* buffer, int32_t bufsiz
 	if (is_64_bit)
 		info->pbsi_flags |= P_LP64;
 
-	return 1;
+	return sizeof(*info);
 reterr:
 	return -EINVAL;
 }
@@ -565,7 +556,7 @@ static long _proc_pidinfo_regionpathinfo(int32_t pid, uint64_t arg, void* buffer
 	if (!buffer)
 		return -EFAULT;
 	if (bufsize < sizeof(my_rpi))
-		return -ENOSPC;
+		return -ENOMEM;
 
 	fd = _proc_pidinfo_regionpath_setup(pid, &buf);
 	if (fd < 0)
@@ -626,7 +617,7 @@ static long _proc_pidinfo_regionpath(int32_t pid, uint64_t arg, void* buffer, in
 	if (!buffer)
 		return -EFAULT;
 	if (buffer_size < sizeof(my_rp))
-		return -ENOSPC;
+		return -ENOMEM;
 
 	fd = _proc_pidinfo_regionpath_setup(pid, &readline_buffer);
 	if (fd < 0)
@@ -748,6 +739,108 @@ static bool parse_smaps_firstline(
 	return true;
 }
 
+// enum vtype in <sys/vnode.h>
+enum { VNON, VREG, VDIR, VBLK, VCHR, VLNK, VSOCK, VFIFO };
+
+// fi_type values (DTYPE_* in <sys/file_internal.h>)
+#define DTYPE_VNODE 1
+
+static int vnode_type_from_mode(unsigned int mode)
+{
+	switch (mode & S_IFMT)
+	{
+		case S_IFREG: return VREG;
+		case S_IFDIR: return VDIR;
+		case S_IFBLK: return VBLK;
+		case S_IFCHR: return VCHR;
+		case S_IFLNK: return VLNK;
+		case S_IFSOCK: return VSOCK;
+		case S_IFIFO: return VFIFO;
+		default: return VNON;
+	}
+}
+
+static long _proc_pidfdinfo_vnodepath(int32_t pid, int fd, void* buffer, int32_t bufsize)
+{
+	struct vnode_fdinfowithpath* info = (struct vnode_fdinfowithpath*) buffer;
+	struct vchroot_expand_args procpath;
+	struct vchroot_unexpand_args uargs;
+	struct linux_stat st;
+	int ret;
+
+	if (bufsize < (int32_t) sizeof(*info))
+		return -ENOMEM;
+
+	// The host's /proc belongs to another PID namespace; resolve the path in
+	// the prefix to reach its own procfs. The fd entry itself is a symlink and
+	// must not be followed here.
+	__simple_sprintf(procpath.path, "/proc/%d/fd/%d", pid, fd);
+	procpath.flags = 0;
+	procpath.dfd = LINUX_AT_FDCWD;
+	ret = vchroot_expand(&procpath);
+	if (ret < 0)
+		return errno_linux_to_bsd(ret);
+
+	ret = LINUX_SYSCALL(__NR_readlinkat, procpath.dfd, procpath.path, uargs.path, sizeof(uargs.path) - 1);
+	if (ret < 0)
+	{
+		// Tell a missing process from a descriptor that is not open
+		if (ret == -LINUX_ENOENT && LINUX_SYSCALL(__NR_kill, pid, 0) == -LINUX_ESRCH)
+			return -ESRCH;
+		return -EBADF;
+	}
+	uargs.path[ret] = '\0';
+
+	// Sockets, pipes and other descriptors without a path are not vnodes
+	if (uargs.path[0] != '/')
+		return -EBADF;
+
+#ifdef __NR_newfstatat
+	ret = LINUX_SYSCALL(__NR_newfstatat, procpath.dfd, procpath.path, &st, 0);
+#else
+	ret = LINUX_SYSCALL(__NR_fstatat64, procpath.dfd, procpath.path, &st, 0);
+#endif
+	if (ret < 0)
+		return errno_linux_to_bsd(ret);
+
+	ret = vchroot_unexpand(&uargs);
+	if (ret != 0)
+		return ret;
+
+	memset(info, 0, sizeof(*info));
+	info->pfi.fi_type = DTYPE_VNODE;
+	info->pvip.vip_vi.vi_type = vnode_type_from_mode(st.st_mode);
+	info->pvip.vip_vi.vi_stat.vst_dev = st.st_dev;
+	info->pvip.vip_vi.vi_stat.vst_ino = st.st_ino;
+	info->pvip.vip_vi.vi_stat.vst_mode = st.st_mode;
+	info->pvip.vip_vi.vi_stat.vst_nlink = st.st_nlink;
+	info->pvip.vip_vi.vi_stat.vst_uid = st.st_uid;
+	info->pvip.vip_vi.vi_stat.vst_gid = st.st_gid;
+	info->pvip.vip_vi.vi_stat.vst_size = st.st_size;
+	info->pvip.vip_vi.vi_stat.vst_blocks = st.st_blocks;
+	info->pvip.vip_vi.vi_stat.vst_blksize = st.st_blksize;
+	info->pvip.vip_vi.vi_stat.vst_rdev = st.st_rdev;
+	strncpy(info->pvip.vip_path, uargs.path, sizeof(info->pvip.vip_path) - 1);
+
+	return sizeof(*info);
+}
+
+static long _proc_pidfdinfo(int32_t pid, uint32_t flavor, int fd, void* buffer, int32_t bufsize)
+{
+	if (!buffer)
+		return -EFAULT;
+
+	switch (flavor)
+	{
+		case PROC_PIDFDVNODEPATHINFO:
+			return _proc_pidfdinfo_vnodepath(pid, fd, buffer, bufsize);
+		default:
+			__simple_fprintf(2, "sys_proc_info(): Unsupported pidfdinfo flavor: %d\n",
+					flavor);
+			return -ENOTSUP;
+	}
+}
+
 static long _proc_pidinfo_pathinfo(int32_t pid, void* buffer, int32_t bufsize)
 {
 	struct vchroot_unexpand_args args;
@@ -757,7 +850,7 @@ static long _proc_pidinfo_pathinfo(int32_t pid, void* buffer, int32_t bufsize)
 
 	if (rv < 0) 
 	{
-		__simple_printf("dserver_rpc_get_executable_path failed internally: %d\n", rv);
+		__simple_fprintf(2, "dserver_rpc_get_executable_path failed internally: %d\n", rv);
 		__simple_abort();
 	}
 	else if (rv > 0) 
@@ -778,7 +871,7 @@ static long _proc_pidinfo_taskinfo(int32_t pid, void* buffer, int32_t bufsize)
 	if (!buffer)
 		return -EFAULT;
 	if (bufsize < sizeof(struct proc_taskinfo))
-		return -ENOSPC;
+		return -ENOMEM;
 
 	char path[64], stat[1024];
 	char *statptr;
@@ -854,7 +947,7 @@ static long _proc_pidinfo_taskallinfo(int32_t pid, void* buffer, int32_t bufsize
 	if (!buffer)
 		return -EFAULT;
 	if (bufsize < sizeof(struct proc_taskallinfo))
-		return -ENOSPC;
+		return -ENOMEM;
 	
 	long err = _proc_pidinfo_tbsdinfo(pid, buffer + offsetof(struct proc_taskallinfo, pbsd), sizeof(struct proc_bsdinfo));
 	
@@ -925,6 +1018,16 @@ static long _proc_pidinfo_listthreads(int32_t pid, void* buffer, int32_t bufsize
 bail:
 	close_internal(fd);
 	return count * sizeof(uint64_t);
+}
+
+long sys_proc_info_extended_id(uint32_t callnum, int32_t pid, uint32_t flavor,
+		uint32_t flags, uint64_t ext_id, uint64_t arg, void* buffer, int32_t bufsize)
+{
+	// NOTE: flags and ext_id (Mach identity token filtering) not yet implemented.
+	// Falling back to standard proc_info is safe for most use cases.
+	(void)flags;
+	(void)ext_id;
+	return sys_proc_info(callnum, pid, flavor, arg, buffer, bufsize);
 }
 
 static long _proc_pidinfo_pidrusage(int32_t pid, uint32_t flavor, void* buffer, int32_t bufsize)
@@ -998,21 +1101,25 @@ static long _proc_pidinfo_pidrusage(int32_t pid, uint32_t flavor, void* buffer, 
 	if (!elem) return -EINVAL;
 	uint64_t stime = __simple_atoi(elem, NULL);
 
-	skip_stat_elems(&statptr, 6); // skip until vsize (priority=1, nice=2, num_threads=3, itrealvalue=4, starttime=5, vsize=6)
+	// cutime, cstime, priority, nice, num_threads, itrealvalue, starttime
+	skip_stat_elems(&statptr, 7);
 	elem = next_stat_elem(&statptr); // vsize
-	elem = next_stat_elem(&statptr); // rss
+	elem = next_stat_elem(&statptr); // rss, in pages
 	if (!elem) return -EINVAL;
 	uint64_t rss = __simple_atoi(elem, NULL);
 
-	long ticks_per_sec = native_sysconf(_SC_CLK_TCK);
+	long ticks_per_sec = native_sysconf(LINUX_SC_CLK_TCK);
 	if (ticks_per_sec <= 0)
 		ticks_per_sec = 100;
+	long page_size = native_sysconf(LINUX_SC_PAGESIZE);
+	if (page_size <= 0)
+		page_size = 4096;
 
 	ri->ri_user_time = (utime * 1000000000ULL) / ticks_per_sec;
 	ri->ri_system_time = (stime * 1000000000ULL) / ticks_per_sec;
 	ri->ri_pageins = majflt;
-	ri->ri_resident_size = rss * 4096;
-	ri->ri_phys_footprint = rss * 4096;
+	ri->ri_resident_size = rss * page_size;
+	ri->ri_phys_footprint = rss * page_size;
 
 	return 0;
 }
@@ -1098,10 +1205,3 @@ static long _proc_pidinfo_vnodepathinfo(int32_t pid, void* buffer, int32_t bufsi
 
 	return sizeof(struct proc_vnodepathinfo);
 }
-
-long sys_proc_info_extended_id(uint32_t callnum, int32_t pid, uint32_t flavor,
-		uint32_t flags, uint64_t ext_id, uint64_t arg, void* buffer, int32_t bufsize)
-{
-	return sys_proc_info(callnum, pid, flavor, arg, buffer, bufsize);
-}
-

@@ -1,5 +1,7 @@
 #include <darling/emulation/other/mach/lkm.h>
+#if defined(__aarch64__)
 #include <darling/emulation/linux_premigration/elfcalls_size.h>
+#endif
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -30,7 +32,10 @@ extern _libkernel_functions_t _libkernel_functions;
 
 VISIBLE
 struct elf_calls* _elfcalls;
+#if defined(__aarch64__)
+// Size of the loader's elf_calls table in bytes, 0 when the loader did not say.
 size_t _elfcalls_size;
+#endif
 
 static bool use_per_thread_driver_fd = false;
 
@@ -38,14 +43,6 @@ extern void _xtrace_postfork_child(void);
 
 void mach_driver_init(const char** applep)
 {
-#ifndef LINUX_PR_SET_PTRACER
-#define LINUX_PR_SET_PTRACER 0x59616d61
-#endif
-#ifndef LINUX_PR_SET_PTRACER_ANY
-#define LINUX_PR_SET_PTRACER_ANY ((unsigned long)-1)
-#endif
-	LINUX_SYSCALL(__NR_prctl, LINUX_PR_SET_PTRACER, LINUX_PR_SET_PTRACER_ANY, 0UL, 0UL, 0UL);
-
 #if defined(__aarch64__)
 	// Both the static dyld copy and the dynamic kernel copy publish TSD. The
 	// latter must initialize this offset too, including on new guest threads.
@@ -71,7 +68,9 @@ void mach_driver_init(const char** applep)
 			{
 				uintptr_t table = (uintptr_t) __simple_atoi16(applep[i] + 10, NULL);
 				_elfcalls = (struct elf_calls*) table;
+#if defined(__aarch64__)
 				_elfcalls_size = elfcalls_size_from_apple(applep);
+#endif
 			}
 		}
 	}
@@ -82,11 +81,13 @@ void mach_driver_init(const char** applep)
 		_libkernel_functions->dyld_func_lookup("__dyld_get_elfcalls", (void**)&p2);
 		if (p2) {
 			_elfcalls = p2();
+#if defined(__aarch64__)
 			size_t (*get_size)(void) = NULL;
 			_elfcalls_size = 0;
 			_libkernel_functions->dyld_func_lookup("__dyld_get_elfcalls_size", (void**)&get_size);
 			if (_elfcalls && get_size)
 				_elfcalls_size = get_size();
+#endif
 		}
 	}
 
@@ -150,6 +151,10 @@ void mach_driver_init(const char** applep)
 		// we're being called in the child after a fork; let xtrace know about it
 		_xtrace_postfork_child();
 	}
+
+	// look up the vDSO clock now, while the host's dynamic loader can be used safely;
+	// the vDSO stays mapped at the same address in a forked child
+	__darling_vdso_clock_init();
 }
 
 __attribute__((visibility("default")))
@@ -176,10 +181,12 @@ void* elfcalls_get_pointer(void) {
 	return _elfcalls;
 };
 
+#if defined(__aarch64__)
 VISIBLE
 size_t elfcalls_get_size(void) {
 	return _elfcalls ? _elfcalls_size : 0;
 }
+#endif
 
 VISIBLE
 uint64_t mach_absolute_time(void)

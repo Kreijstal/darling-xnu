@@ -6,19 +6,29 @@ enable_language(ASM)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -std=gnu99 -fvisibility=hidden -fPIC -fno-builtin -ggdb -Wno-int-conversion -Wno-compare-distinct-pointer-types")
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -nostdlib")
 
-# This controls only kern.osproductversion, not the parent SystemVersion.plist.
-set(DARLING_EMULATED_OS_PRODUCT_VERSION "26.0" CACHE STRING
-	"Product version returned by kern.osproductversion (requires rebuilding libsystem_kernel)")
+# The release this kernel emulates: macOS 26.4, build 25E246, Darwin 25.4.0.
+# kern.osrelease, kern.version, kern.osversion and kern.osproductversion are
+# answered from these values. They are also published as global properties so
+# that the superproject generates SystemVersion.plist from the same release
+# instead of repeating it.
+set(EMULATED_RELEASE "25.4.0")
+set(EMULATED_OSVERSION "25E246")
+set(EMULATED_OSPRODUCTVERSION "26.4")
+
 # What iOS executables get instead: the version UIDevice's systemVersion presents.
 set(DARLING_EMULATED_IOS_PRODUCT_VERSION "14.0" CACHE STRING
 	"Product version returned by kern.osproductversion to iOS executables (requires rebuilding libsystem_kernel)")
 
+set_property(GLOBAL PROPERTY DARLING_KERNEL_RELEASE "${EMULATED_RELEASE}")
+set_property(GLOBAL PROPERTY DARLING_OS_BUILD_VERSION "${EMULATED_OSVERSION}")
+set_property(GLOBAL PROPERTY DARLING_OS_PRODUCT_VERSION "${EMULATED_OSPRODUCTVERSION}")
+
 add_definitions(-DBSDTHREAD_WRAP_LINUX_PTHREAD
 	-DEMULATED_SYSNAME="Darwin"
-	-DEMULATED_RELEASE="25.0.0"
-	-DEMULATED_VERSION="Darwin Kernel Version 25.0.0"
-	-DEMULATED_OSVERSION="20G1120"
-	-DEMULATED_OSPRODUCTVERSION="${DARLING_EMULATED_OS_PRODUCT_VERSION}"
+	-DEMULATED_RELEASE="${EMULATED_RELEASE}"
+	-DEMULATED_VERSION="Darwin Kernel Version ${EMULATED_RELEASE}"
+	-DEMULATED_OSVERSION="${EMULATED_OSVERSION}"
+	-DEMULATED_OSPRODUCTVERSION="${EMULATED_OSPRODUCTVERSION}"
 	-DEMULATED_IOS_OSPRODUCTVERSION="${DARLING_EMULATED_IOS_PRODUCT_VERSION}"
 )
 
@@ -48,6 +58,7 @@ set(common_sources
 
 set(conversion_sources
 	src/conversion/fcntl/open.c
+	src/conversion/network/cmsg.c
 	src/conversion/network/duct.c
 	src/conversion/network/getsockopt.c
 	src/conversion/network/recvmsg.c
@@ -67,11 +78,16 @@ set(linux_premigration_sources
 	src/linux_premigration/ext/epoll_wait.c
 	src/linux_premigration/ext/eventfd.c
 	src/linux_premigration/ext/eventfd_read.c
+	src/linux_premigration/ext/darling-nanosleep.c
 	src/linux_premigration/ext/eventfd_write.c
 	src/linux_premigration/ext/fanotify.c
 	src/linux_premigration/ext/file_handle.c
 	src/linux_premigration/ext/for-libelfloader.c
 	src/linux_premigration/ext/for-libkqueue.c
+	src/linux_premigration/ext/for-platform-identity.c
+	src/linux_premigration/ext/for-sandbox.c
+	src/linux_premigration/ext/for-sysconfig.c
+	src/linux_premigration/ext/host-pid.c
 	src/linux_premigration/ext/for-xtrace.c
 	src/linux_premigration/ext/futex.c
 	src/linux_premigration/ext/inotify_add_watch.c
@@ -101,12 +117,20 @@ set(xnu_syscall_bsd_sources
 	src/xnu_syscall/bsd/bsd_syscall_table.c
 	src/xnu_syscall/bsd/bsd_syscall.S
 
+	src/xnu_syscall/bsd/helper/bpf/bpf_device.c
+	src/xnu_syscall/bsd/helper/bpf/bpf_program.c
+
+	src/xnu_syscall/bsd/helper/stat/guest_mount.c
+
 	src/xnu_syscall/bsd/helper/ioctl/termios.c
 	src/xnu_syscall/bsd/helper/ioctl/filio.c
 	src/xnu_syscall/bsd/helper/ioctl/socket.c
 	src/xnu_syscall/bsd/helper/misc/common_at.c
 	src/xnu_syscall/bsd/helper/misc/readline.c
 	src/xnu_syscall/bsd/helper/misc/fdpath.c
+	src/xnu_syscall/bsd/helper/misc/nofile_limit.c
+	src/xnu_syscall/bsd/helper/misc/host_platform.c
+	src/xnu_syscall/bsd/helper/misc/platform_identity.c
 	src/xnu_syscall/bsd/helper/misc/sysctl_hw.c
 	src/xnu_syscall/bsd/helper/misc/sysctl_kern.c
 	src/xnu_syscall/bsd/helper/misc/sysctl_machdep.c
@@ -159,6 +183,7 @@ set(xnu_syscall_bsd_sources
 	src/xnu_syscall/bsd/impl/misc/csrctl.c
 	src/xnu_syscall/bsd/impl/misc/fileport_makefd.c
 	src/xnu_syscall/bsd/impl/misc/fileport_makeport.c
+	src/xnu_syscall/bsd/impl/misc/fsctl.c
 	src/xnu_syscall/bsd/impl/misc/fsgetpath.c
 	src/xnu_syscall/bsd/impl/misc/getentropy.c
 	src/xnu_syscall/bsd/impl/misc/gethostuuid.c
@@ -167,6 +192,7 @@ set(xnu_syscall_bsd_sources
 	src/xnu_syscall/bsd/impl/misc/getrusage.c
 	src/xnu_syscall/bsd/impl/misc/iopolicysys.c
 	src/xnu_syscall/bsd/impl/misc/kdebug_trace.c
+	src/xnu_syscall/bsd/impl/misc/mac_syscall.c
 	src/xnu_syscall/bsd/impl/misc/proc_info.c
 	src/xnu_syscall/bsd/impl/misc/ptrace.c
 	src/xnu_syscall/bsd/impl/misc/reboot.c
@@ -176,6 +202,7 @@ set(xnu_syscall_bsd_sources
 	src/xnu_syscall/bsd/impl/misc/syscall.c
 	src/xnu_syscall/bsd/impl/misc/sysctl.c
 	src/xnu_syscall/bsd/impl/misc/thread_selfid.c
+	src/xnu_syscall/bsd/impl/misc/thread_selfusage.c
 	src/xnu_syscall/bsd/impl/mman/madvise.c
 	src/xnu_syscall/bsd/impl/mman/mman.c
 	src/xnu_syscall/bsd/impl/mman/msync.c
@@ -200,6 +227,8 @@ set(xnu_syscall_bsd_sources
 	src/xnu_syscall/bsd/impl/process/getpriority.c
 	src/xnu_syscall/bsd/impl/process/posix_spawn.c
 	src/xnu_syscall/bsd/impl/process/setpriority.c
+	src/xnu_syscall/bsd/impl/process/task_inspect_for_pid.c
+	src/xnu_syscall/bsd/impl/process/task_read_for_pid.c
 	src/xnu_syscall/bsd/impl/process/vfork.c
 	src/xnu_syscall/bsd/impl/process/wait4.c
 	src/xnu_syscall/bsd/impl/process/waitid.c
@@ -236,6 +265,7 @@ set(xnu_syscall_bsd_sources
 	src/xnu_syscall/bsd/impl/stat/mkdirat.c
 	src/xnu_syscall/bsd/impl/stat/mkfifo.c
 	src/xnu_syscall/bsd/impl/stat/mkfifoat.c
+	src/xnu_syscall/bsd/impl/stat/mount_table.c
 	src/xnu_syscall/bsd/impl/stat/rmdir.c
 	src/xnu_syscall/bsd/impl/stat/stat.c
 	src/xnu_syscall/bsd/impl/stat/stat64_extended.c

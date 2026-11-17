@@ -8,10 +8,16 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/process/fork.h>
 
 extern struct elf_calls* _elfcalls;
+
+#if defined(__aarch64__)
+// On ARM64 the loader states how large its table is (see elfcalls_size.h), and
+// members past that size are not used: a loader built without a member leaves
+// whatever follows its table in that slot.
 extern size_t _elfcalls_size;
 
 #define ELFCALLS_HAS_FIELD(field) (_elfcalls && \
-	_elfcalls_size >= offsetof(struct elf_calls, field) + sizeof(_elfcalls->field))
+	_elfcalls_size >= __builtin_offsetof(struct elf_calls, field) + sizeof(_elfcalls->field))
+#endif
 
 struct elf_calls* elfcalls(void)
 {
@@ -46,12 +52,17 @@ long native_sysconf(int name)
 
 int native_fork(void)
 {
+#if defined(__aarch64__)
+	// The caller reports the error like any failed fork.
 	if (!ELFCALLS_HAS_FIELD(native_fork) || !_elfcalls->native_fork)
 		return -LINUX_ENOSYS;
 	return _elfcalls->native_fork();
+#else
+	return elfcalls()->native_fork();
+#endif
 }
 
-#if defined(__arm64__) || defined(__aarch64__)
+#if defined(__aarch64__)
 __attribute__((visibility("default")))
 void __darling_arm64_thread_bridge_postfork_complete(void)
 {

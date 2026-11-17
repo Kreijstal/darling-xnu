@@ -41,6 +41,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/misc/csrctl.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/misc/fileport_makefd.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/misc/fileport_makeport.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/misc/fsctl.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/misc/fsgetpath.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/misc/getentropy.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/misc/gethostuuid.h>
@@ -49,6 +50,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/misc/getrusage.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/misc/iopolicysys.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/misc/kdebug_trace.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/misc/mac_syscall.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/misc/proc_info.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/misc/ptrace.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/misc/reboot.h>
@@ -58,6 +60,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/misc/syscall.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/misc/sysctl.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/misc/thread_selfid.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/misc/thread_selfusage.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/mman/madvise.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/mman/mman.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/mman/msync.h>
@@ -82,6 +85,8 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/process/getpriority.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/process/posix_spawn.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/process/setpriority.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/process/task_inspect_for_pid.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/process/task_read_for_pid.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/process/vfork.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/process/wait4.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/process/waitid.h>
@@ -227,7 +232,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/xattr/setattrlistat.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/xattr/setxattr.h>
 
-void* __bsd_syscall_table[600] = {
+void* __bsd_syscall_table[BSD_SYSCALL_TABLE_SIZE] = {
 	[0] = sys_syscall,
 	[1] = sys_exit,
 	[2] = sys_fork,
@@ -375,8 +380,10 @@ void* __bsd_syscall_table[600] = {
 	[239] = sys_fremovexattr,
 	[240] = sys_listxattr,
 	[241] = sys_flistxattr,
+	[242] = sys_fsctl,
 	[243] = sys_initgroups,
 	[244] = sys_posix_spawn,
+	[245] = sys_ffsctl,
 	[254] = sys_semctl,
 	[255] = sys_semget,
 	[256] = sys_semop,
@@ -441,6 +448,7 @@ void* __bsd_syscall_table[600] = {
 	[369] = sys_kevent64,
 	[372] = sys_thread_selfid,
 	[374] = sys_kevent_qos,
+	[381] = sys___mac_syscall,
 	[394] = sys_pselect,
 	[395] = sys_pselect_nocancel,
 	[396] = sys_read_nocancel,
@@ -497,6 +505,7 @@ void* __bsd_syscall_table[600] = {
 	[475] = sys_mkdirat,
 	[476] = sys_getattrlistat,
 	[478] = sys_bsdthread_ctl,
+	[482] = sys_thread_selfusage,
 	[483] = sys_csrctl,
 	[500] = sys_getentropy,
 	[515] = sys_ulock_wait,
@@ -507,13 +516,14 @@ void* __bsd_syscall_table[600] = {
 	[521] = sys_abort_with_payload,
 	[524] = sys_setattrlistat,
 	[527] = sys_ntp_adjtime,
-	[539] = sys_fsgetpath,
+  [538] = sys_task_inspect_for_pid,
+	[539] = sys_task_read_for_pid,
 	[540] = sys_preadv,
 	[541] = sys_pwritev,
 	[542] = sys_preadv_nocancel,
 	[543] = sys_pwritev_nocancel,
 	[544] = sys_ulock_wait2,
 	[545] = sys_proc_info_extended_id,
-	[546] = sys_mkfifoat,
-	[547] = sys_mknodat,
+	[553] = sys_mkfifoat,
+	[554] = sys_mknodat,
 };

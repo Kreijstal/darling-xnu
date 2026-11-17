@@ -8,17 +8,9 @@
 #include <sys/stat.h>
 
 #include <darling/emulation/conversion/stat/common.h>
+#include <darling/emulation/conversion/stat/dev.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/getuid.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/getgid.h>
-
-static inline unsigned int dev_linux_to_bsd(unsigned long long ldev)
-{
-	// Darwin dev_t packs major in bits [31:24] (8 bits) and minor in bits [23:0].
-	// Linux majors > 255 are truncated to 8 bits to fit Darwin dev_t ABI.
-	unsigned int maj = ((ldev >> 8) & 0xfff) | ((unsigned int)(ldev >> 32) & ~0xfff);
-	unsigned int min = (ldev & 0xff) | ((unsigned int)(ldev >> 12) & 0xfff00);
-	return (maj << 24) | (min & 0xffffff);
-}
 
 void stat_linux_to_bsd(const struct linux_stat* lstat, struct stat* stat)
 {
@@ -98,10 +90,12 @@ static unsigned int statfs_flags_linux_to_bsd(long linux_flags)
 	return bsd_flags;
 }
 
-void statfs_linux_to_bsd(const struct linux_statfs64* lstat, struct bsd_statfs* stat)
+void statfs_linux_to_bsd64(const struct linux_statfs64* lstat, struct bsd_statfs64* stat)
 {
+	__builtin_memset(stat, 0, sizeof(*stat));
 	stat->f_type = lstat->f_type;
 	stat->f_bsize = lstat->f_bsize;
+	stat->f_iosize = lstat->f_bsize;
 	stat->f_blocks = lstat->f_blocks;
 	stat->f_bfree = lstat->f_bfree;
 	stat->f_bavail = lstat->f_bavail;
@@ -111,15 +105,38 @@ void statfs_linux_to_bsd(const struct linux_statfs64* lstat, struct bsd_statfs* 
 	stat->f_flags = statfs_flags_linux_to_bsd(lstat->f_flags);
 }
 
-void statfs_linux_to_bsd64(const struct linux_statfs64* lstat, struct bsd_statfs64* stat)
+// A count that doesn't fit the legacy structure's 32-bit long fields.
+//
+// QUIRK: macOS reports f_files of 0x7fffffffffffffff (APFS) as -1 (all bits set) in the 32-bit statfs without
+// 64-bit inodes. It is not documented how other values above 32 bits are reduced; they are clamped to the same
+// all-ones value rather than truncated, so a large volume is never reported as a small one (conservative choice,
+// inference only for the range between 2^32 and 2^63).
+// Evidence: black-box observation on macOS 10.14.4 i386 (tier 2).
+// Test: tests/statfs-legacy-abi.c (check_count_clamp)
+static long statfs_legacy_count(unsigned long long value)
 {
-	stat->f_type = lstat->f_type;
-	stat->f_bsize = lstat->f_bsize;
-	stat->f_blocks = lstat->f_blocks;
-	stat->f_bfree = lstat->f_bfree;
-	stat->f_bavail = lstat->f_bavail;
-	stat->f_files = lstat->f_files;
-	stat->f_ffree = lstat->f_ffree;
-	stat->f_fsid = lstat->f_fsid;
-	stat->f_flags = statfs_flags_linux_to_bsd(lstat->f_flags);
+	if (sizeof(long) == 4 && value > 0xffffffffULL)
+		return (long) 0xffffffffUL;
+	return (long) value;
+}
+
+void statfs_bsd64_to_bsd(const struct bsd_statfs64* wide, struct bsd_statfs* stat)
+{
+	// f_otype, f_oflags, f_reserved1 and the other fields without a value are 0, as on macOS
+	__builtin_memset(stat, 0, sizeof(*stat));
+	stat->f_bsize = statfs_legacy_count(wide->f_bsize);
+	stat->f_iosize = statfs_legacy_count((unsigned int) wide->f_iosize);
+	stat->f_blocks = statfs_legacy_count(wide->f_blocks);
+	stat->f_bfree = statfs_legacy_count(wide->f_bfree);
+	stat->f_bavail = statfs_legacy_count(wide->f_bavail);
+	stat->f_files = statfs_legacy_count(wide->f_files);
+	stat->f_ffree = statfs_legacy_count(wide->f_ffree);
+	stat->f_fsid = wide->f_fsid;
+	stat->f_owner = wide->f_owner;
+	stat->f_type = (short) wide->f_type;
+	stat->f_flags = (long) wide->f_flags;
+	// the names are cut to the legacy field sizes (MFSNAMELEN, MNAMELEN)
+	__builtin_memcpy(stat->f_fstypename, wide->f_fstypename, sizeof(stat->f_fstypename) - 1);
+	__builtin_memcpy(stat->f_mntonname, wide->f_mntonname, sizeof(stat->f_mntonname) - 1);
+	__builtin_memcpy(stat->f_mntfromname, wide->f_mntfromname, sizeof(stat->f_mntfromname) - 1);
 }

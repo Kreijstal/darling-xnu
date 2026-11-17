@@ -66,9 +66,6 @@ extern int memcmp(const void* dest, const void* src, __SIZE_TYPE__ n);
 #define LINUX_S_IFMT 00170000
 #define LINUX_S_IFLNK 0120000
 
-#define __simple_printf(...)
-// #define __simple_printf __simple_kprintf // For bug hunting
-
 #endif
 
 static bool next_component(const char* from, const char** end);
@@ -163,15 +160,11 @@ static void init_vchroot_path(void)
 	uint64_t tmp_len;
 	int code = dserver_rpc_vchroot_path(prefix_path, sizeof(prefix_path), &tmp_len);
 	if (code < 0) {
-		__simple_printf("Failed to get vchroot path: %d\n", code);
+		__simple_kprintf("Failed to get vchroot path: %d\n", code);
 		__simple_abort();
 	}
 
 	prefix_path_len = (int)tmp_len;
-
-#ifndef TEST
-	__simple_printf("init_vchroot_path: %s\n", prefix_path);
-#endif
 }
 
 int vchroot_expand(struct vchroot_expand_args* args)
@@ -181,7 +174,6 @@ int vchroot_expand(struct vchroot_expand_args* args)
 #ifndef TEST
 	if (prefix_path_len <= 0)
 		init_vchroot_path();
-	__simple_printf("vchroot_expand(): input %s\n", args->path);
 #endif
 
 	ctxt.unknown_component = false;
@@ -234,12 +226,7 @@ int vchroot_expand(struct vchroot_expand_args* args)
 		#endif
 
 		if (rv < 0)
-		{
-#ifndef TEST
-			__simple_printf("    dfd %d -> err %d!\n", args->dfd, rv);
-#endif
 			return rv;
-		}
 		
 		// If we got "/", then turn it into "", because our algorithm will add a trailing slash later
 		if (rv == 1 && ctxt.current_path[0] == '/')
@@ -266,10 +253,6 @@ int vchroot_expand(struct vchroot_expand_args* args)
 		strcpy(args->path, ctxt.current_path);
 	else
 		strcpy(args->path, "/");
-
-#ifndef TEST
-	__simple_printf("    vchroot_expand(): rv=%d, expanded to %s\n", rv, args->path);
-#endif
 
 	return rv;
 }
@@ -344,7 +327,7 @@ static int vchroot_run(const char* input_path, struct context* ctxt)
 						// We cannot exit current_root via ..
 						if (ctxt->current_path_len < ctxt->current_root_len)
 						{
-							// Branch 2 (post-pop safety clamp): if popping a path component
+							// Post-pop safety clamp: if popping a path component
 							// left the path shallower than current_root, clamp back to current_root
 							// rather than failing with -LINUX_ENOENT (which broke cd .. from root).
 							strcpy(ctxt->current_path, ctxt->current_root);
@@ -371,7 +354,12 @@ static int vchroot_run(const char* input_path, struct context* ctxt)
 				if (!ctxt->unknown_component)
 				{
 					stat_t st;
-					#if defined(__NR_lstat)
+					// struct linux_stat has the stat64 layout on i386, so
+					// prefer lstat64 there; the older lstat fills a smaller
+					// struct and st_mode would be read from the wrong offset.
+					#if defined(__NR_lstat64)
+						int status = LINUX_SYSCALL(__NR_lstat64, ctxt->current_path, &st);
+					#elif defined(__NR_lstat)
 						int status = LINUX_SYSCALL(__NR_lstat, ctxt->current_path, &st);
 					#else
 						#if __NR_newfstatat
@@ -474,7 +462,11 @@ done_getdents:
 							// however, DON'T resolve `/proc` symlinks within the prefix.
 							// anything under `/proc` is from Linux's `/proc` since we bind-mount it, so we can special-case them because we want those to be Linux-root relative.
 							// see https://github.com/darlinghq/darling/issues/1052 for the issue this works around.
-							if (link[0] == '/' && !(strncmp(link, "/proc/", 6) == 0 || (rv == 5 && strncmp(link, "/proc", 5) == 0))) {
+							//
+							// symlinks found after leaving the prefix through /Volumes/SystemRoot
+							// (current_root is empty) are host symlinks, so they stay relative
+							// to the host root (e.g. /etc/resolv.conf -> /run/...).
+							if (link[0] == '/' && ctxt->current_root_len > 0 && !(strncmp(link, "/proc/", 6) == 0 || (rv == 5 && strncmp(link, "/proc", 5) == 0))) {
 								ctxt->current_root = prefix_path;
 								ctxt->current_root_len = prefix_path_len;
 							}
@@ -568,10 +560,6 @@ int vchroot_fdpath(struct vchroot_fdpath_args* args)
 		memcpy(args->path, EXIT_PATH, sizeof(EXIT_PATH) - 1);
 		memcpy(args->path + sizeof(EXIT_PATH) - 1, link, rv+1);
 	}
-
-#ifndef TEST
-	__simple_printf("fdpath %d -> %s\n", args->fd, args->path);
-#endif
 
 	return 0;
 }

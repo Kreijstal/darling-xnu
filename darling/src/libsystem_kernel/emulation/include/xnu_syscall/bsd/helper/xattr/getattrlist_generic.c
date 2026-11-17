@@ -27,7 +27,7 @@
 #define ATTR_VOL_UUID 0x00040000
 #define ATTR_VOL_ATTRIBUTES 0x40000000
 #define ATTR_VOL_INFO 0x80000000
-#define VOLUME_SUPPORTED (ATTR_VOL_CAPABILITIES | ATTR_VOL_ATTRIBUTES | ATTR_VOL_INFO)
+#define VOLUME_SUPPORTED (ATTR_VOL_CAPABILITIES | ATTR_VOL_UUID | ATTR_VOL_ATTRIBUTES | ATTR_VOL_INFO)
 #define DIR_SUPPORTED (ATTR_DIR_ENTRYCOUNT)
 #define DIR_SUPPORTED_ALL (DIR_SUPPORTED | 0x00000001 | 0x00000004)
 #define FILE_SUPPORTED (ATTR_FILE_RSRCLENGTH)
@@ -158,6 +158,21 @@ static void pack_uint64(char* destination, uint64_t value)
 	memcpy(destination, &value, sizeof(value));
 }
 
+// ATTR_VOL_UUID. Linux gives no persistent volume identity here, so build a
+// version 8 (custom) UUID from the device number of the volume root (the caller
+// resolves the root, so a path inside the volume gives the same value): distinct
+// mounts get distinct values and a mount keeps its value while it is mounted.
+static void attribute_volume_uuid(uint64_t device, unsigned char* uuid)
+{
+	memset(uuid, 0, 16);
+	for (int i = 0; i < 6; ++i)
+		uuid[i] = (unsigned char)(device >> (8 * i));
+	uuid[6] = 0x80 | (unsigned char)((device >> 48) & 0x0f);
+	uuid[7] = (unsigned char)(device >> 52);
+	uuid[8] = 0x80; // RFC 9562 variant
+	memcpy(uuid + 9, "darling", 7);
+}
+
 #if !HAS_PATH
 static int attribute_fd_finder_info(int fd, int volume, char* output)
 {
@@ -280,6 +295,14 @@ static int attribute_validate_request(struct xnu_attrlist* alist, unsigned long 
 
 static int attribute_directory_mount_status(int fd, const char* path, uint32_t* status);
 
+static int attribute_is_zero(const char* bytes, __SIZE_TYPE__ length)
+{
+	for (__SIZE_TYPE__ i = 0; i < length; ++i)
+		if (bytes[i])
+			return 0;
+	return 1;
+}
+
 static long
 attribute_get_object(int fd,
 
@@ -287,7 +310,8 @@ attribute_get_object(int fd,
 const char* path,
 #endif
 
-struct xnu_attrlist* alist, void *attributeBuffer, __SIZE_TYPE__ bufferSize, unsigned long options)
+struct xnu_attrlist* alist, void *attributeBuffer, __SIZE_TYPE__ bufferSize, unsigned long options,
+int bulk)
 {
 	int rv;
 	char *ourBuffer, *next;
@@ -299,6 +323,9 @@ struct xnu_attrlist* alist, void *attributeBuffer, __SIZE_TYPE__ bufferSize, uns
 	__SIZE_TYPE__ itemNameLength = 0;
 	__SIZE_TYPE__ fullPathLength = 0;
 	char fullPath[4096];
+#if !HAS_PATH
+	char descriptorPath[4096];
+#endif
 	__SIZE_TYPE__ variableSize = 0;
 	__SIZE_TYPE__ fixedSize;
 	uint32_t packedCommon;
@@ -340,7 +367,12 @@ rv = LINUX_SYSCALL(__NR_fstatat64, vc.dfd, vc.path, &fileStat,
 	if (rv < 0)
 		return errno_linux_to_bsd(rv);
 #else
+#ifdef __NR_fstat64
+	// i386: __NR_fstat fills the old, narrower struct stat.
+	rv = LINUX_SYSCALL(__NR_fstat64, fd, &fileStat);
+#else
 	rv = LINUX_SYSCALL(__NR_fstat, fd, &fileStat);
+#endif
 	if (rv < 0)
 		return errno_linux_to_bsd(rv);
 #endif
@@ -372,15 +404,23 @@ rv = LINUX_SYSCALL(__NR_fstatat64, vc.dfd, vc.path, &fileStat,
 
 	if (alist->commonattr & ATTR_CMN_NAME) {
 #if HAS_PATH
-		__SIZE_TYPE__ end = strlen(vc.path);
-		while (end > 1 && vc.path[end - 1] == '/') --end;
-		itemName = vc.path;
-		for (__SIZE_TYPE__ i = 0; i < end; ++i)
-			if (vc.path[i] == '/' && i + 1 < end) itemName = vc.path + i + 1;
-		itemNameLength = vc.path + end - itemName + 1;
+		const char* namePath = vc.path;
 #else
-		if (!returnSupportedAttributes) return -EINVAL;
+		// The name is the last component of the descriptor's path, as for
+		// getattrlist() on that path.
+		const char* namePath = descriptorPath;
+		struct vchroot_fdpath_args args = { .fd = fd, .path = descriptorPath,
+			.maxlen = sizeof(descriptorPath) };
+		rv = vchroot_fdpath(&args);
+		if (rv < 0)
+			return errno_linux_to_bsd(rv);
 #endif
+		__SIZE_TYPE__ end = strlen(namePath);
+		while (end > 1 && namePath[end - 1] == '/') --end;
+		itemName = (char*)namePath;
+		for (__SIZE_TYPE__ i = 0; i < end; ++i)
+			if (namePath[i] == '/' && i + 1 < end) itemName = (char*)namePath + i + 1;
+		itemNameLength = namePath + end - itemName + 1;
 	}
 
 	if (alist->commonattr & 0x00000200) {
@@ -448,12 +488,6 @@ rv = LINUX_SYSCALL(__NR_fstatat64, vc.dfd, vc.path, &fileStat,
 
 	packedCommon = packInvalidAttributes ? alist->commonattr :
 		(alist->commonattr & (availableCommon | ATTR_CMN_RETURNED_ATTRS));
-#if !HAS_PATH
-	// The fd path does not supply names. Match the returned mask: unsupported
-	// fields occupy slots only when the caller explicitly requests placeholders.
-	if (!packInvalidAttributes)
-		packedCommon &= ~ATTR_CMN_NAME;
-#endif
 	packedDir = packInvalidAttributes ? alist->dirattr : (alist->dirattr & availableDir);
 	packedFile = packInvalidAttributes ? alist->fileattr : (alist->fileattr & FILE_SUPPORTED_ALL);
 	// File and directory groups are mutually exclusive for a concrete object,
@@ -466,15 +500,20 @@ rv = LINUX_SYSCALL(__NR_fstatat64, vc.dfd, vc.path, &fileStat,
 	packedVolume = packInvalidAttributes ? alist->volattr : (alist->volattr & VOLUME_SUPPORTED);
 
 	if (packInvalidAttributes || returnSupportedAttributes) {
-		spaceNeeded += packed_width(packedCommon, common_attr_widths);
-		spaceNeeded += packed_width(packedDir, dir_attr_widths);
-		spaceNeeded += packed_width(packedFile, file_attr_widths);
-		spaceNeeded += packed_width(packedExtended, extended_attr_widths);
-		if (packedCommon & 0x00000001) {
-#if HAS_PATH
+		// The fixed-size part has room for every requested attribute of the
+		// object's kind, also for one that is not returned; returned ones
+		// are packed from the start and the unused room stays at the end.
+		// (The attribute group that does not apply to the object, file or
+		// directory, gets no room.)
+		uint32_t reservedCommon = alist->volattr ? packedCommon : alist->commonattr;
+		uint32_t reservedDir = S_ISDIR(fileStat.st_mode) ? alist->dirattr : 0;
+		uint32_t reservedFile = S_ISDIR(fileStat.st_mode) ? 0 : alist->fileattr;
+		spaceNeeded += packed_width(reservedCommon, common_attr_widths);
+		spaceNeeded += packed_width(reservedDir, dir_attr_widths);
+		spaceNeeded += packed_width(reservedFile, file_attr_widths);
+		spaceNeeded += packed_width(alist->forkattr, extended_attr_widths);
+		if (packedCommon & 0x00000001)
 			variableSize += (itemNameLength + 3) & ~((__SIZE_TYPE__)3);
-#endif
-		}
 		if (packedCommon & 0x08000000) {
 			variableSize += (fullPathLength + 3) & ~((__SIZE_TYPE__)3);
 		}
@@ -499,8 +538,11 @@ rv = LINUX_SYSCALL(__NR_fstatat64, vc.dfd, vc.path, &fileStat,
 			spaceNeeded += sizeof(int64_t);
 	}
 
-	if (!attributeBuffer || bufferSize < 4 ||
-		(bufferSize < spaceNeeded && !(options & FSOPT_REPORT_FULLSIZE)))
+	// Only a buffer too small for the length field is an error. A larger
+	// buffer that cannot hold everything gets the leading part of the
+	// result, and the length field always holds the full size, with or
+	// without FSOPT_REPORT_FULLSIZE (as observed on macOS).
+	if (!attributeBuffer || bufferSize < 4)
 		return -ERANGE;
 	fixedSize = spaceNeeded - variableSize;
 	ourBuffer = (char*) __builtin_alloca(spaceNeeded);
@@ -521,9 +563,6 @@ rv = LINUX_SYSCALL(__NR_fstatat64, vc.dfd, vc.path, &fileStat,
 		char* variable = ourBuffer + fixedSize;
 		uint32_t* returned = (uint32_t*)next;
 		returned[0] = (alist->commonattr & availableCommon) | ATTR_CMN_RETURNED_ATTRS;
-#if !HAS_PATH
-		returned[0] &= ~ATTR_CMN_NAME;
-#endif
 		returned[1] = alist->volattr & VOLUME_SUPPORTED;
 		returned[2] = packedDir & availableDir;
 		returned[3] = packedFile & FILE_SUPPORTED_ALL;
@@ -577,6 +616,16 @@ rv = LINUX_SYSCALL(__NR_fstatat64, vc.dfd, vc.path, &fileStat,
 #endif
 				if (rv < 0)
 					memset(next, 0, 32);
+				// getattrlist() leaves an all-zero (or missing) FinderInfo out
+				// of the returned attributes and packs the attributes after it
+				// in its place; its 32 bytes stay reserved, unused, at the end
+				// of the fixed-size part. getattrlistbulk() and
+				// FSOPT_PACK_INVAL_ATTRS always return and pack it in place.
+				if (!bulk && !packInvalidAttributes && attribute_is_zero(next, 32)) {
+					memset(next, 0, 32);
+					returned[0] &= ~ATTR_CMN_FNDRINFO;
+					continue;
+				}
 			} else if (width->bit == 0x00008000) {
 				*((uint32_t*)next) = fileStat.st_uid;
 			} else if (width->bit == 0x00010000) {
@@ -619,7 +668,9 @@ rv = LINUX_SYSCALL(__NR_fstatat64, vc.dfd, vc.path, &fileStat,
 				continue;
 			// The buffer is zeroed: unknown capability bits and unsupported
 			// PACK_INVAL slots (including references) stay zero.
-			if (width->bit == ATTR_VOL_ATTRIBUTES) {
+			if (width->bit == ATTR_VOL_UUID) {
+				attribute_volume_uuid(fileStat.st_dev, (unsigned char*)next);
+			} else if (width->bit == ATTR_VOL_ATTRIBUTES) {
 				attribute_pack_support((uint32_t*)next);
 			}
 			next += width->width;
@@ -713,6 +764,10 @@ rv = LINUX_SYSCALL(__NR_fstatat64, vc.dfd, vc.path, &fileStat,
 		capabilities[4] = capabilities[5] = capabilities[6] = capabilities[7] = 0;
 		next += sizeof(uint32_t) * 8;
 	}
+	if (alist->volattr & ATTR_VOL_UUID) {
+		attribute_volume_uuid(fileStat.st_dev, (unsigned char*)next);
+		next += 16;
+	}
 	if (alist->volattr & ATTR_VOL_ATTRIBUTES) {
 		attribute_pack_support((uint32_t*)next);
 		next += sizeof(uint32_t) * ATTR_BIT_MAP_COUNT * 2;
@@ -738,8 +793,7 @@ rv = LINUX_SYSCALL(__NR_fstatat64, vc.dfd, vc.path, &fileStat,
 
 attributes_packed:
 
-	*((uint32_t*)ourBuffer) = (options & FSOPT_REPORT_FULLSIZE) ?
-		spaceNeeded : min(bufferSize, spaceNeeded);
+	*((uint32_t*)ourBuffer) = spaceNeeded;
 
 	memcpy(attributeBuffer, ourBuffer, min(bufferSize, spaceNeeded));
 	
@@ -767,8 +821,7 @@ static int attribute_directory_mount_status(int fd, const char* path, uint32_t* 
 		result = guest_fd < 0 ? errno_linux_to_bsd(guest_fd) : 0;
 	}
 	if (result >= 0) {
-		char record[16384];
-		root_fd = attribute_open_volume_root(object, guest_fd, record, sizeof(record));
+		root_fd = attribute_open_volume_root(object, guest_fd);
 		result = root_fd < 0 ? root_fd : 0;
 	}
 	if (result >= 0) {
@@ -797,12 +850,13 @@ long FUNC_NAME(int fd,
 	int validation = attribute_validate_request(alist, options);
 	if (validation < 0)
 		return validation;
-	if (!alist->volattr || !(alist->commonattr & COMMON_SUPPORTED & 0x0027fff7U))
+	// ATTR_VOL_UUID comes from the volume root's device, whichever object was asked about.
+	if (!alist->volattr || !((alist->commonattr & COMMON_SUPPORTED & 0x0027fff7U) || (alist->volattr & ATTR_VOL_UUID)))
 		return attribute_get_object(fd,
 #if HAS_PATH
 			path,
 #endif
-			alist, buffer, size, options);
+			alist, buffer, size, options, 0);
 
 	int object = fd, result;
 #if HAS_PATH
@@ -827,8 +881,7 @@ long FUNC_NAME(int fd,
 		result = guest_fd < 0 ? errno_linux_to_bsd(guest_fd) : 0;
 	}
 	if (result >= 0) {
-		char record[16384];
-		root_fd = attribute_open_volume_root(object, guest_fd, record, sizeof(record));
+		root_fd = attribute_open_volume_root(object, guest_fd);
 		result = root_fd < 0 ? root_fd : 0;
 	}
 	if (guest_fd >= 0)
@@ -842,7 +895,7 @@ long FUNC_NAME(int fd,
 #if HAS_PATH
 		".",
 #endif
-		alist, buffer, size, options);
+		alist, buffer, size, options, 0);
 	close_internal(root_fd);
 	return packed;
 }

@@ -8,17 +8,33 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/fcntl/open.h>
 #include <darling/emulation/xnu_syscall/bsd/helper/misc/readline.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/close.h>
+#include <darling/emulation/xnu_syscall/bsd/helper/misc/platform_identity.h>
+
+// The configured CPU brand string (`CPUBrandString`), if there is one.
+static const char* configured_brand_string(void)
+{
+	const dserver_platform_identity_t* identity = platform_identity();
+
+	if (!identity || identity->cpu_brand_string[0] == '\0')
+		return NULL;
+	return identity->cpu_brand_string;
+}
 
 #if defined(__aarch64__) || defined(__arm64__)
 // ARM64: provide stub sysctl tables (no CPUID on ARM)
 
 extern char *strncpy(char *dest, const char *src, __SIZE_TYPE__ n);
-extern int strncmp(const char* str1, const char* str2, __SIZE_TYPE__ n);
 
 static sysctl_handler(handle_arm_stub)
 {
-	copyout_string("ARM64", (char*) old, oldlen);
-	return 0;
+	return copyout_string("ARM64", (char*) old, oldlen);
+}
+
+static sysctl_handler(handle_arm_brand_string)
+{
+	const char* brand = configured_brand_string();
+
+	return copyout_string(brand ? brand : "ARM64", (char*) old, oldlen);
 }
 
 enum {
@@ -35,7 +51,7 @@ static sysctl_handler(handle_core_count);
 
 const struct known_sysctl sysctls_machdep_cpu[] = {
 	{ .oid = _CPU_VENDOR, .type = CTLTYPE_STRING, .exttype = "S", .name = "vendor", .handler = handle_arm_stub },
-	{ .oid = _CPU_BRAND_STRING, .type = CTLTYPE_STRING, .exttype = "S", .name = "brand_string", .handler = handle_arm_stub },
+	{ .oid = _CPU_BRAND_STRING, .type = CTLTYPE_STRING, .exttype = "S", .name = "brand_string", .handler = handle_arm_brand_string },
 	{ .oid = _CPU_CORE_COUNT, .type = CTLTYPE_INT, .exttype = "I", .name = "core_count", .handler = handle_core_count },
 	{ .oid = -1 }
 };
@@ -52,7 +68,7 @@ sysctl_handler(handle_core_count)
 	sysctl_handle_size(sizeof(int));
 
 	int count = 1;
-	int fd = sys_open("/proc/cpuinfo", LINUX_O_RDONLY, 0);
+	int fd = sys_open_nocancel("/proc/cpuinfo", LINUX_O_RDONLY, 0);
 	if (fd < 0)
 		goto out;
 	count = 0;
@@ -63,7 +79,7 @@ sysctl_handler(handle_core_count)
 		if (strncmp(line, "processor", 9) == 0)
 			count++;
 	}
-	sys_close(fd);
+	sys_close_nocancel(fd);
 	if (count == 0) count = 1;
 out:
 	__builtin_memcpy(old, &count, sizeof(count));
@@ -88,7 +104,7 @@ enum {
 	_CPU_BRAND_STRING,
 	_CPU_FEATURES,
 	_CPU_CORE_COUNT,
-	_CPU_SIGNATURE,
+	_CPU_THREAD_COUNT,
 	_CPU_FEATURE_BITS,
 };
 
@@ -100,7 +116,7 @@ static sysctl_handler(handle_stepping);
 static sysctl_handler(handle_brand_string);
 static sysctl_handler(handle_features);
 static sysctl_handler(handle_core_count);
-static sysctl_handler(handle_signature);
+static sysctl_handler(handle_thread_count);
 static sysctl_handler(handle_feature_bits);
 
 const struct known_sysctl sysctls_machdep_cpu[] = {
@@ -112,8 +128,8 @@ const struct known_sysctl sysctls_machdep_cpu[] = {
 		{ .oid = _CPU_BRAND_STRING, .type = CTLTYPE_STRING, .exttype = "S", .name = "brand_string", .handler = handle_brand_string },
 		{ .oid = _CPU_FEATURES, .type = CTLTYPE_STRING, .exttype = "S", .name = "features", .handler = handle_features },
 		{ .oid = _CPU_CORE_COUNT, .type = CTLTYPE_INT, .exttype = "I", .name = "core_count", .handler = handle_core_count },
-	{ .oid = _CPU_SIGNATURE, .type = CTLTYPE_INT, .exttype = "IU", .name = "signature", .handler = handle_signature },
-	{ .oid = _CPU_FEATURE_BITS, .type = CTLTYPE_QUAD, .exttype = "QU", .name = "feature_bits", .handler = handle_feature_bits },
+		{ .oid = _CPU_THREAD_COUNT, .type = CTLTYPE_INT, .exttype = "I", .name = "thread_count", .handler = handle_thread_count },
+	{ .oid = _CPU_FEATURE_BITS, .type = CTLTYPE_QUAD, .exttype = "IU", .name = "feature_bits", .handler = handle_feature_bits },
 	{ .oid = -1 }
 };
 
@@ -132,10 +148,10 @@ const struct known_sysctl sysctls_machdep[] = {
 #ifndef setup
 #define setup(value)\
             unsigned int level = value; \
-            unsigned int eax = 0;       \
-            unsigned int ebx = 0;       \
-            unsigned int edx = 0;       \
-            unsigned int ecx = 0
+            unsigned int eax;           \
+            unsigned int ebx;           \
+            unsigned int edx;           \
+            unsigned int ecx
 #endif
 
 
@@ -153,17 +169,9 @@ static inline void copyout_int(int value, void* to_copy, unsigned long* to_copy_
 }
 
 
-sysctl_handler(handle_signature)
-{
-    if (!oldlen) return -EINVAL;
-    if (_new) return -EPERM;
-    sysctl_handle_size(sizeof(uint32_t));
-    setup(1);
-    __cpuid(level, eax, ebx, ecx, edx);
-    *(uint32_t*)old = eax;
-    return 0;
-}
-
+// The CPUID leaf 1 feature flags: ECX in the upper and EDX in the lower half.
+// On macOS this is a 64-bit value whose format string is "IU" (observed on
+// macOS 27 under Rosetta); there is no machdep.cpu.signature there.
 sysctl_handler(handle_feature_bits)
 {
     if (!oldlen) return -EINVAL;
@@ -193,9 +201,7 @@ sysctl_handler(handle_vendor)
     __cpuid(level, eax, v.ebx, v.ecx, v.edx);
 
 	v.name[12] = 0;
-	copyout_string(v.name, (char*) old, oldlen);
-
-	return 0;
+	return copyout_string(v.name, (char*) old, oldlen);
 }
 
 sysctl_handler(handle_max_basic)
@@ -253,12 +259,18 @@ sysctl_handler(handle_stepping)
 
 sysctl_handler(handle_brand_string)
 {
+    const char* brand = configured_brand_string();
+    if (brand != NULL)
+        return copyout_string(brand, (char*) old, oldlen);
+
     setup(0x80000000);
 
-    __cpuid(level, eax, ebx, ecx, edx);
+    __cpuid(level,eax,ebx, ecx, edx);
 
     if (eax < 0x80000004) // the information is not implemented
         return 2;
+
+
 
     union
     {
@@ -266,22 +278,17 @@ sysctl_handler(handle_brand_string)
         char name[49];
     } v;
 
-    for (int i = 2; i <= 4; i++)
-    {
-        __cpuid(0x80000000 + i, eax, ebx, ecx, edx);
-        v.brand[0x0 + (i - 2) * 4] = eax;
-        v.brand[0x1 + (i - 2) * 4] = ebx;
-        v.brand[0x2 + (i - 2) * 4] = ecx;
-        v.brand[0x3 + (i - 2) * 4] = edx;
-    }
+		for (int i = 1; i < 4; i++)
+		{
+				__cpuid(0x80000001 + i, eax, ebx, ecx, edx);
+				v.brand[0x0+(i-1)*4] = eax;
+				v.brand[0x1+(i-1)*4] = ebx;
+				v.brand[0x2+(i-1)*4] = ecx;
+				v.brand[0x3+(i-1)*4] = edx;
+		}
 
     v.name[48] = 0;
-    char *name_ptr = v.name;
-    while (*name_ptr == ' ') name_ptr++;
-
-    copyout_string(name_ptr, (char*) old, oldlen);
-
-    return 0;
+    return copyout_string(v.name, (char*) old, oldlen);
 }
 
 sysctl_handler(handle_features)
@@ -317,35 +324,37 @@ sysctl_handler(handle_features)
 	}
 	buf[len] = '\0';
 
-	copyout_string(buf, (char*)old, oldlen);
-	return 0;
+	return copyout_string(buf, (char*)old, oldlen);
 }
 
 
-// TODO: i doubt core count is ever going to change.
+// Reads a per-package count ("cpu cores" or "siblings") from /proc/cpuinfo; like
+// machdep.cpu.core_count and machdep.cpu.thread_count on XNU, these describe one package.
+// it's easier to use /proc/cpuinfo for this.
+// using cpuid directly is more difficult because AMD processors don't use the same method as Intel processors.
+// TODO: i doubt these counts are ever going to change.
 //       this is something that could be cached if we had some way of doing something only once in libsystem_kernel (i.e. a simple version of dispatch_once).
-sysctl_handler(handle_core_count) {
-	// it's easier to use /proc/cpuinfo for this.
-	// using cpuid directly is more difficult because AMD processors don't use the same method as Intel processors.
-
+static uint32_t cpuinfo_package_count(const char* field)
+{
 	int infofd = sys_open_nocancel("/proc/cpuinfo", BSD_O_RDONLY, 0);
 	struct rdline_buffer rbuf;
 	const char* line;
+	size_t field_length = __simple_strlen(field);
 
 	// a reasonable default
-	size_t core_count = 1;
+	uint32_t count = 1;
 
 	if (infofd < 0)
-		goto out;
+		return count;
 
 	_readline_init(&rbuf);
 
 	while ((line = _readline(infofd, &rbuf)) != NULL) {
-		if (strncmp(line, "cpu cores", 9) != 0) {
+		if (strncmp(line, field, field_length) != 0) {
 			continue;
 		}
 
-		// great, we've got "cpu cores"
+		// great, we've got the field
 		// now find the actual number
 		while (*line != ':' && *line != '\0')
 			++line;
@@ -362,17 +371,34 @@ sysctl_handler(handle_core_count) {
 		if (*line == '\0')
 			continue;
 
-		core_count = __simple_atoi(line, NULL);
+		count = __simple_atoi(line, NULL);
 		break;
 	}
 
-out:
-	if (infofd >= 0)
-		close_internal(infofd);
+	close_internal(infofd);
+
+	if (count == 0)
+		count = 1;
+	return count;
+}
+
+static void copyout_count(uint32_t count, void* old, unsigned long* oldlen)
+{
 	if (old != NULL && oldlen && *oldlen >= sizeof(uint32_t))
-		*(uint32_t*)old = core_count;
+		*(uint32_t*)old = count;
 	if (oldlen)
 		*oldlen = sizeof(uint32_t);
+}
+
+// the number of cores in a package
+sysctl_handler(handle_core_count) {
+	copyout_count(cpuinfo_package_count("cpu cores"), old, oldlen);
+	return 0;
+}
+
+// the number of logical CPUs (hardware threads) in a package
+sysctl_handler(handle_thread_count) {
+	copyout_count(cpuinfo_package_count("siblings"), old, oldlen);
 	return 0;
 }
 

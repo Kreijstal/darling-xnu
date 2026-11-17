@@ -12,6 +12,8 @@
 #include <darling/emulation/linux_premigration/vchroot_expand.h>
 #include <darling/emulation/common/bsdthread/per_thread_wd.h>
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
+#include <darling/emulation/xnu_syscall/bsd/helper/stat/guest_mount.h>
+#include <darling/emulation/xnu_syscall/bsd/helper/stat/linux_statfs.h>
 
 #undef strlcpy
 
@@ -22,21 +24,20 @@ extern int strncmp(const char* s1, const char* s2, __SIZE_TYPE__ len);
 
 long sys_statfs(const char* path, struct bsd_statfs* buf)
 {
-#ifdef __x86_64__
-	return sys_statfs64(path, (struct bsd_statfs64*) buf);
-#else
-#	warning Not implemented
+	// the legacy structure (every architecture has one, with the long fields of its own width)
+	struct bsd_statfs64 wide;
+	long ret = sys_statfs64(path, &wide);
+
+	if (ret < 0)
+		return ret;
+	statfs_bsd64_to_bsd(&wide, buf);
 	return 0;
-#endif
 }
 
 long sys_statfs64(const char* path, struct bsd_statfs64* buf)
 {
-	int fd, ret;
-	struct simple_readline_buf rbuf;
+	int ret;
 	struct linux_statfs64 lbuf;
-	char line[512];
-	int max_len = 0;
 
 	struct vchroot_expand_args vc;
 	vc.flags = VCHROOT_FOLLOW;
@@ -47,58 +48,12 @@ long sys_statfs64(const char* path, struct bsd_statfs64* buf)
 	if (ret < 0)
 		return errno_linux_to_bsd(ret);
 
-#ifdef __NR_statfs64
-	ret = LINUX_SYSCALL2(__NR_statfs64, vc.path, &lbuf);
-#else
-	ret = LINUX_SYSCALL2(__NR_statfs, vc.path, &lbuf);
-#endif
+	ret = linux_statfs_path(vc.path, &lbuf);
 
 	if (ret < 0)
 		return errno_linux_to_bsd(ret);
 
 	statfs_linux_to_bsd64(&lbuf, buf);
 
-	fd = sys_open("/proc/self/mounts", O_RDONLY, 0);
-	if (fd < 0)
-		return fd;
-	
-	__simple_readline_init(&rbuf);
-
-	buf->f_mntonname[0] = 0;
-	buf->f_fstypename[0] = 0;
-	buf->f_mntfromname[0] = 0;
-
-	while (__simple_readline(fd, &rbuf, line, sizeof(line)))
-	{
-		char* p;
-		char* saveptr;
-		char* mntfrom;
-		int len;
-
-		p = strtok_r(line, " ", &saveptr);
-		if (p == NULL)
-			continue;
-
-		mntfrom = p;
-		p = strtok_r(NULL, " ", &saveptr);
-		if (p == NULL)
-			continue;
-		
-		len = strlen(p);
-		if (strncmp(p, vc.path, len) != 0 || len < max_len)
-			continue;
-
-		max_len = len;
-		strlcpy(buf->f_mntonname, p, sizeof(buf->f_mntonname));
-
-		p = strtok_r(NULL, " ", &saveptr);
-		if (p == NULL)
-			continue;
-
-		strlcpy(buf->f_fstypename, p, sizeof(buf->f_fstypename));
-		strlcpy(buf->f_mntfromname, mntfrom, sizeof(buf->f_mntfromname));
-	}
-
-	close_internal(fd);
-	return 0;
+	return guest_mount_describe(vc.path, buf);
 }

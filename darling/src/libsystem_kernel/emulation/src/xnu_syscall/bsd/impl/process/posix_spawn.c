@@ -28,6 +28,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/setpgid.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/signal/sigprocmask.h>
 #include <darling/emulation/other/mach/lkm.h>
+#include <darling/emulation/common/guarded/table.h>
 #include <darling/emulation/common/simple.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/process/fork.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/chdir.h>
@@ -58,9 +59,12 @@ long sys_posix_spawn(int* pid, const char* path, const struct _posix_spawn_args_
 	if (ret < 0)
 		return ret;
 
-	// posix_spawn in macOS does not invoke fork handlers.
-	// Userspace atfork preparation causes deadlocks with multithreaded processes (like cmake).
-	// _libkernel_functions->posix_spawn_prepare();
+	// we don't want to call user atfork callbacks, but we *do* want to call most
+	// libsystem atfork callbacks to set up the environment for some of the calls we need
+	// to make for the setup (e.g. dup2() file actions take libkqueue's locks, which only
+	// the child callback resets)
+
+	_libkernel_functions->posix_spawn_prepare();
 
 	if ((my_pid = sys_fork()) == 0)
 	{
@@ -68,11 +72,11 @@ long sys_posix_spawn(int* pid, const char* path, const struct _posix_spawn_args_
 		// close the reading side
 		close_internal(pipe[0]);
 
-		// _libkernel_functions->posix_spawn_child();
+		_libkernel_functions->posix_spawn_child();
 
 #if defined(__arm64__) || defined(__aarch64__)
 		// sys_fork defers the darlingserver checkin on arm64 until libSystem's
-		// fork child handlers have run; posix_spawn runs none, so do it here.
+		// fork child handlers have run; do it once posix_spawn_child() has run them.
 		sys_fork_postfork_child();
 #endif
 
@@ -116,7 +120,7 @@ no_fork:
 
 			if (desc->attrp->psa_flags & POSIX_SPAWN_CLOEXEC_DEFAULT) {
 				// set O_CLOEXEC on everything
-				int dir = sys_open("/proc/self/fd", BSD_O_RDONLY, 0);
+				int dir = sys_open_nocancel("/proc/self/fd", BSD_O_RDONLY, 0);
 				char buf[4096];
 				int len = 0;
 
@@ -142,6 +146,13 @@ no_fork:
 						// FIXME: pretty sure this should not be hardcoded
 						if (fd == 1023 || fd == mach_driver_get_fd()) {
 							// special commpage fd and darlingserver RPC socket
+							continue;
+						}
+
+						// Darling's own descriptors (the RPC socket and the
+						// process lifetime pipe) are not the program's;
+						// leave them as they are
+						if (guard_table_check(fd, guard_flag_prevent_close)) {
 							continue;
 						}
 
@@ -183,13 +194,13 @@ no_fork:
 
 						//__simple_kprintf("setting cloexec on %d\n", fd);
 
-						ret = sys_fcntl(fd, F_GETFD, 0);
+						ret = sys_fcntl_nocancel(fd, F_GETFD, 0);
 						if (ret < 0) {
 							close_internal(dir);
 							goto fail;
 						}
 
-						ret = sys_fcntl(fd, F_SETFD, ret | FD_CLOEXEC);
+						ret = sys_fcntl_nocancel(fd, F_SETFD, ret | FD_CLOEXEC);
 						if (ret < 0) {
 							close_internal(dir);
 							goto fail;
@@ -253,7 +264,7 @@ no_fork:
 					case XNU_PSFA_OPEN:
 					{
 						//__simple_kprintf("opening %s to %d\n", act->psfaa_openargs.psfao_path, act->psfaa_filedes);
-						ret = sys_open(act->psfaa_openargs.psfao_path,
+						ret = sys_open_nocancel(act->psfaa_openargs.psfao_path,
 								act->psfaa_openargs.psfao_oflag, act->psfaa_openargs.psfao_mode);
 						if (ret < 0)
 							goto fail;
@@ -291,11 +302,11 @@ no_fork:
 					// unset CLOEXEC on this fd
 					case XNU_PSFA_INHERIT: {
 						//__simple_kprintf("inheriting %d\n", act->psfaa_filedes);
-						ret = sys_fcntl(act->psfaa_filedes, F_GETFD, 0);
+						ret = sys_fcntl_nocancel(act->psfaa_filedes, F_GETFD, 0);
 						if (ret < 0) {
 							goto fail;
 						}
-						ret = sys_fcntl(act->psfaa_filedes, F_SETFD, ret & ~FD_CLOEXEC);
+						ret = sys_fcntl_nocancel(act->psfaa_filedes, F_SETFD, ret & ~FD_CLOEXEC);
 						if (ret < 0) {
 							goto fail;
 						}
@@ -315,6 +326,10 @@ no_fork:
 		{
 			char** new_envp;
 			int i, env_len = 0;
+			static char* empty_envp[] = { NULL };
+
+			if (envp == NULL)
+				envp = empty_envp;
 
 			while (envp[env_len])
 				env_len++;
@@ -345,7 +360,7 @@ fail:
 		}
 		else
 		{
-			sys_write(pipe[1], &ret, sizeof(ret));
+			sys_write_nocancel(pipe[1], &ret, sizeof(ret));
 			sys_exit(127);
 			__builtin_unreachable();
 		}
@@ -358,7 +373,7 @@ fail:
 		// close the writing side
 		close_internal(pipe[1]);
 
-		// _libkernel_functions->posix_spawn_parent();
+		_libkernel_functions->posix_spawn_parent();
 
 		if (my_pid < 0)
 		{
@@ -369,7 +384,7 @@ fail:
 		if (pid != NULL)
 			*pid = my_pid;
 
-		if (sys_read(pipe[0], &ret, sizeof(ret)) != sizeof(ret))
+		if (sys_read_nocancel(pipe[0], &ret, sizeof(ret)) != sizeof(ret))
 			ret = 0;
 		close_internal(pipe[0]);
 	}

@@ -168,7 +168,7 @@ set(syscall_dynamic_sources
 
 # select-pre1050 conflicts with select-cancel on ARM64 (duplicate symbols);
 # pre-1050 legacy wrappers are only needed for i386/x86_64 compatibility
-if (NOT TARGET_ARM64 AND NOT CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+if (NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
 	set(syscall_select_pre1050_source wrappers/legacy/select-pre1050.c)
 endif()
 
@@ -410,13 +410,13 @@ set(syscall_sources
 	bsdsyscalls/_getdirentriesattr.S
 	bsdsyscalls/_getdirentries.S
 	bsdsyscalls/_getdtablesize.S
-	bsdsyscalls/_getegid.S
+	bsdsyscalls/___getegid.S
 	bsdsyscalls/_getentropy.S
-	bsdsyscalls/_geteuid.S
+	bsdsyscalls/___geteuid.S
 	bsdsyscalls/_getfh.S
 	bsdsyscalls/_getfsstat64.S
 	bsdsyscalls/_getfsstat.S
-	bsdsyscalls/_getgid.S
+	bsdsyscalls/___getgid.S
 	bsdsyscalls/_getgroups.S
 	bsdsyscalls/___gethostuuid.S
 	bsdsyscalls/_getitimer.S
@@ -435,7 +435,7 @@ set(syscall_sources
 	bsdsyscalls/_getsockopt.S
 	bsdsyscalls/___gettid.S
 	bsdsyscalls/___gettimeofday.S
-	bsdsyscalls/_getuid.S
+	bsdsyscalls/___getuid.S
 	bsdsyscalls/___getwgroups.S
 	bsdsyscalls/_getxattr.S
 	bsdsyscalls/_grab_pgo_data.S
